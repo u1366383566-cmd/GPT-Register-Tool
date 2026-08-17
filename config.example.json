@@ -292,7 +292,7 @@
     "registration_timeout": 180
   },
   "phone_reuse": {
-    "source": "smsbower",
+    "source": "5sim",
     "max_reuse_count": 1,
     "send_cooldown_seconds": 45,
     "send_retry_attempts": 3,
@@ -301,6 +301,19 @@
     "proxy": "http://127.0.0.1:7897",
     "proxy_match_phone_country": false,
     "proxy_random_sid": false,
+    "5sim": {
+      "api_key": "$5SIM_API_KEY",
+      "product": "openai",
+      "country": "ghana",
+      "operator": "any",
+      "max_price": "",
+      "sms_timeout": 120,
+      "sms_poll_interval": 5,
+      "number_attempts": 3,
+      "send_cooldown_seconds": 45,
+      "send_retry_attempts": 3,
+      "send_retry_delay_seconds": 45
+    },
     "smsbower": {
       "api_key": "$SMSBOWER_API_KEY",
       "service": "dr",

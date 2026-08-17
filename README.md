@@ -229,7 +229,8 @@ OTP 解析支持主题匹配、发件人过滤、收件人精确匹配、服务�
 
 ### 手机接码
 
-- 支持 SMSBower 国家与价格档位查询。
+- 支持 SMSBower 与 5sim.net 两种接码服务商（默认 5sim，可在设置/一键接码中选择）。
+- 5sim 使用 `https://5sim.net/v1` API，凭据为 5sim 用户中心的 Bearer Token（`phone_reuse.5sim.api_key` 或环境变量 `5SIM_API_KEY`），支持国家/运营商/产品三级选择。
 - 支持发送重试、等待超时和轮询间隔配置。
 - 支持 Codex OAuth 手机验证和账号刷新流程。
 - 批量操作保持邮箱与手机号结果映射，便于排查单账号失败。

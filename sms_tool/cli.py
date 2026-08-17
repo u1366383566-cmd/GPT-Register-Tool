@@ -127,7 +127,7 @@ def _registration_phone_pool(args):
     )
     if not phone_pool.phones:
         if explicit:
-            print("[Error] --phone-reuse enabled but no phone numbers configured. Add phone_reuse.smsbower.api_key, SMSBOWER_API_KEY, phone_reuse.phone_pool, or paypal_auto.phone_numbers")
+            print("[Error] --phone-reuse enabled but no phone numbers configured. Add phone_reuse.smsbower.api_key, phone_reuse.5sim.api_key (or SMSBOWER_API_KEY / 5SIM_API_KEY), phone_reuse.phone_pool, or paypal_auto.phone_numbers")
             raise SystemExit(2)
         return None
 
@@ -213,7 +213,8 @@ def main():
     parser.add_argument("--remail-product-id", type=int, default=None, help=argparse.SUPPRESS)
     parser.add_argument("--mailbox-file", default=None, help="Unified mailbox file: Graph, Gmail, ReMail, CFWorker, or iCloud receive URL")
     parser.add_argument("--chatai-mailbox-file", default=None, help="Legacy mixed mailbox file: Chatai plus all unified mailbox formats")
-    parser.add_argument("--phone-register", action="store_true", help="Register with phone number via SMSBower instead of email")
+    parser.add_argument("--phone-register", action="store_true", help="Register with phone number via SMSBower/5sim instead of email")
+    parser.add_argument("--phone-provider", default=None, choices=["smsbower", "5sim"], help="Phone vendor for --phone-register (default: phone_reuse.source / auto)")
     parser.add_argument("--smsbower-country", default=None, help="SMSBower country ID for phone registration (default: from config)")
     parser.add_argument("--skip-paypal-link", action="store_true", help=argparse.SUPPRESS)
     parser.add_argument("--registration-mode", choices=["passwordless", "password", "har", "legacy"], default=None, help="Registration auth mode: passwordless/HAR login_or_signup (default) or legacy password")
@@ -343,8 +344,8 @@ def main():
     parser.add_argument("--registration-at-only", action="store_true", default=True, help="Compatibility flag; protocol registration is AT-only by default")
     parser.add_argument("--no-2fa", action="store_true", help="Skip TOTP 2FA enrollment after a successful registration")
     parser.add_argument("--phone-reuse", action="store_true", help="Enable phone number reuse: one phone verifies up to N accounts")
-    parser.add_argument("--no-phone-reuse", action="store_true", help="Disable phone verification even when smsbower is configured")
-    parser.add_argument("--phone-source", default=None, choices=["smsbower", "phone_pool"], help="Override phone source for registration/one-click SMS")
+    parser.add_argument("--no-phone-reuse", action="store_true", help="Disable phone verification even when a phone vendor is configured")
+    parser.add_argument("--phone-source", default=None, choices=["smsbower", "5sim", "phone_pool"], help="Override phone source for registration/one-click SMS (default: auto, prefers 5sim when both vendors configured)")
     parser.add_argument("--max-reuse-count", type=int, default=0, help="Max times a phone can be reused (0=config default or 1)")
     parser.add_argument("--phone-send-cooldown", type=int, default=None, help="Seconds to wait before sending another OTP to the same phone")
     args = parser.parse_args()
@@ -525,7 +526,7 @@ def main():
     # Phone reuse pool (auto-enable when smsbower or paypal_auto phone is configured)
     phone_pool = _registration_phone_pool(args)
 
-    # Phone registration mode (via SMSBower)
+    # Phone registration mode (via SMSBower/5sim)
     if getattr(args, "phone_register", False):
         from .registration import run_phone_register
         proxy_pool = _proxy_pool_values(args)
@@ -544,6 +545,7 @@ def main():
                 password=args.password,
                 codex_oauth=False,
                 smsbower_country=args.smsbower_country,
+                provider=args.phone_provider,
             )
             results.append(result)
             if result.get("success"):
@@ -1711,7 +1713,7 @@ def _one_click_sms(args):
         source_override=args.phone_source,
     )
     if not phone_pool.phones:
-        print("[Error] --one-click-sms requires a phone pool. Configure phone_reuse.smsbower.api_key/SMSBOWER_API_KEY or phone_reuse.phone_pool.")
+        print("[Error] --one-click-sms requires a phone pool. Configure phone_reuse.smsbower.api_key, phone_reuse.5sim.api_key (or SMSBOWER_API_KEY / 5SIM_API_KEY), or phone_reuse.phone_pool.")
         raise SystemExit(2)
     phone_pool.reset_exhausted_smsbower_slots()
     print_phone_pool_status(phone_pool)

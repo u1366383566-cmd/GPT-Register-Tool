@@ -98,10 +98,11 @@ namespace SmsWorkbench
                 // switch the purchase flow back to code mode.
                 SetPath(root, "email_registration.remail.service_mode", "purchase");
                 // phone_reuse.py defaults source to "auto", which falls back to the static
-                // phone pool when no SMSBower key is configured.  The desktop surface
-                // intentionally dropped static phone-pool editing, so keep pinning the
-                // SMSBower seam here.
-                SetPath(root, "phone_reuse.source", "smsbower");
+                // phone pool when no phone vendor key is configured.  The desktop surface
+                // intentionally dropped static phone-pool editing, so pin the vendor seam
+                // here: 5sim wins when it is configured (user preference), otherwise
+                // SMSBower keeps the legacy default.
+                SetPath(root, "phone_reuse.source", ResolvePhoneSource(fields));
                 RemovePath(root, "phone_reuse.smsbower.pool_size");
                 RemovePath(root, "phone_reuse.phone_pool");
                 RemovePath(root, "protocol_payments.methods.blik.blik_code");
@@ -252,6 +253,23 @@ namespace SmsWorkbench
 
         private static SettingFieldViewModel Find(IEnumerable<SettingFieldViewModel> fields, string key)
             => fields.First(field => string.Equals(field.Key, key, StringComparison.Ordinal));
+
+        private static string ResolvePhoneSource(IEnumerable<SettingFieldViewModel> fields)
+        {
+            // 5sim is the desktop default; keep SMSBower only when 5sim is unset.
+            if (HasPhoneVendorKey(Find(fields, "5sim_api_key").Value, "5SIM_API_KEY"))
+                return "5sim";
+            return "smsbower";
+        }
+
+        private static bool HasPhoneVendorKey(string value, string envName)
+        {
+            string text = (value ?? "").Trim();
+            if (text.Length == 0) return false;
+            if (text == "$" + envName || text == "YOUR_" + envName)
+                return !string.IsNullOrWhiteSpace(Environment.GetEnvironmentVariable(envName));
+            return true;
+        }
 
         private static string[] ParseList(string value)
             => (value ?? "")

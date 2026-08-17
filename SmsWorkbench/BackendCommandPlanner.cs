@@ -181,15 +181,17 @@ namespace SmsWorkbench
             IReadOnlyList<string> emails,
             string sessionFile,
             IReadOnlyList<string> proxyPool,
-            string tempDirectory = null)
+            string tempDirectory = null,
+            string phoneSource = "5sim")
         {
             RequireArgument(mailboxArgument, nameof(mailboxArgument));
             RequireArgument(mailboxFile, nameof(mailboxFile));
             IReadOnlyList<string> targets = RequireEmails(emails);
+            string normalized = NormalizePhoneSource(phoneSource);
             var args = new List<string>
             {
                 "--one-click-sms",
-                "--phone-source", "smsbower",
+                "--phone-source", normalized,
                 "--workers", "1",
                 "--refresh-timeout", "60",
                 mailboxArgument, mailboxFile,
@@ -368,6 +370,12 @@ namespace SmsWorkbench
         {
             string value = (target ?? "").Trim().ToLowerInvariant();
             return value is "sub2api" or "cliproxyapi" ? value : "cpa";
+        }
+
+        public static string NormalizePhoneSource(string phoneSource)
+        {
+            string value = (phoneSource ?? "").Trim().ToLowerInvariant();
+            return value is "5sim" or "smsbower" ? value : "5sim";
         }
 
         public static string ImportTargetLabel(string target)

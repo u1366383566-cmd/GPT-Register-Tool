@@ -188,7 +188,16 @@ namespace SmsWorkbench
             var rows = SelectedEmailRowsOrNotify("接码");
             if (rows.Count == 0) return;
 
-            if (!await ShowSmsBowerOneClickDialogAsync())
+            string provider = await ShowOneClickSmsProviderDialogAsync();
+            if (string.IsNullOrWhiteSpace(provider))
+            {
+                return;
+            }
+
+            bool confirmed = provider == "5sim"
+                ? await ShowFiveSimOneClickDialogAsync()
+                : await ShowSmsBowerOneClickDialogAsync();
+            if (!confirmed)
             {
                 return;
             }
@@ -205,7 +214,8 @@ namespace SmsWorkbench
                 mailboxFile,
                 rows.Select(r => r.Identifier.Trim()).ToList(),
                 rows.Count == 1 ? SessionFileFor(rows[0]) : "",
-                GetRegistrationProxyPool());
+                GetRegistrationProxyPool(),
+                phoneSource: provider);
             // Ensure temp files are cleaned up by the coordinator
             RunBackend(plan.TaskName, plan.Arguments.ToList());
         }

@@ -181,6 +181,7 @@ def run_phone_register(
     smsbower_country=None,
     smsbower_api_key=None,
     bind_email=None,
+    provider=None,
 ):
     """Register a ChatGPT account via phone number (SMS OTP), then optionally bind email."""
     return _run_phone_register_impl(
@@ -191,6 +192,7 @@ def run_phone_register(
         smsbower_country=smsbower_country,
         smsbower_api_key=smsbower_api_key,
         bind_email=bind_email,
+        provider=provider,
     )
 
 
