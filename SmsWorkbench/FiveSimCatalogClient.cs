@@ -39,15 +39,19 @@ namespace SmsWorkbench
                 throw new InvalidDataException("5sim 价格接口未返回国家列表");
             }
 
-            foreach (JsonProperty countryProperty in document.RootElement.EnumerateObject())
+            // /guest/prices?product=X returns {product: {country: {operator: {...}}}}
+            // (product-first), while the unfiltered /guest/prices is country-first.
+            // Detect the product-first shape so the product-filtered catalog works.
+            JsonElement catalog = document.RootElement;
+            if (catalog.TryGetProperty(product, out JsonElement productNode)
+                && productNode.ValueKind == JsonValueKind.Object)
             {
-                if (!countryProperty.Value.TryGetProperty(product, out JsonElement productNode)
-                    || productNode.ValueKind != JsonValueKind.Object)
-                {
-                    continue;
-                }
+                catalog = productNode;
+            }
 
-                var operators = productNode.EnumerateObject()
+            foreach (JsonProperty countryProperty in catalog.EnumerateObject())
+            {
+                var operators = countryProperty.Value.EnumerateObject()
                     .Select(ParseOperator)
                     .Where(item => item != null && item.Count > 0)
                     .OrderBy(item => item.NumericPrice)
