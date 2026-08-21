@@ -12,6 +12,10 @@ from .paths import project_path, runtime_file
 
 
 EXTRA_COLUMNS = {
+    "source": "TEXT DEFAULT ''",
+    "register_method": "TEXT DEFAULT 'unknown'",
+    "session_type": "TEXT DEFAULT 'unknown'",
+    "plan_type": "TEXT DEFAULT 'unknown'",
     "batch_id": "TEXT DEFAULT ''",
     "registration_state": "TEXT DEFAULT ''",
     "registration_country": "TEXT DEFAULT ''",
@@ -158,6 +162,12 @@ def _ensure_extra_columns(conn):
         UPDATE accounts
         SET refresh_token_status='no_rt'
         WHERE refresh_token_status IS NULL OR refresh_token_status=''
+    """)
+    conn.execute("""
+        UPDATE accounts
+        SET plan_type=lower(account_type)
+        WHERE (plan_type IS NULL OR plan_type='' OR plan_type='unknown')
+          AND account_type IS NOT NULL AND account_type <> ''
     """)
 
 
@@ -417,6 +427,8 @@ def _status(data, paypal, access_token, has_refresh_token=False):
         return "mailbox_failed"
     if failure_class == "auth_state" and data.get("success") is False:
         return "auth_state_failed"
+    if failure_class == "rate_limit" and data.get("success") is False:
+        return "rate_limited"
     if explicit in {"k12_joined", "k12_requested", "k12_left", "k12_verify_failed"}:
         return explicit
     if _looks_at_invalid(data, paypal):
@@ -523,6 +535,10 @@ def upsert_account(
 
     row = {
         "email": email,
+        "source": model.source,
+        "register_method": model.register_method,
+        "session_type": model.session_type,
+        "plan_type": model.plan_type,
         "password": model.password,
         "success": _as_bool(_success_value(data, access_token)),
         "status": status,
@@ -623,7 +639,7 @@ def record_registration_audit(data, *, batch_id="", state="", runtime_config: Co
         "registration_attempts": _as_int(data.get("registration_attempts")),
         "terminal": "account_deactivated" in error.lower(),
     }
-    init_database()
+    init_database(runtime_config=runtime_config)
     conn = _connect(runtime_config=runtime_config)
     try:
         conn.execute(

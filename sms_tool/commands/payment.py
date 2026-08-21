@@ -14,6 +14,7 @@ import re
 import sys
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any
 
 from ..payment_routing import (
@@ -80,6 +81,17 @@ def payment_country(payment_method: str, explicit: str = "") -> str:
     from ..payment_link_manager import PAYMENT_METHODS
 
     method = str(payment_method or "paypal").strip().lower().replace("-", "_")
+    try:
+        from ..config import CFG
+        protocol = CFG.get("protocol_payments") if isinstance(CFG.get("protocol_payments"), Mapping) else {}
+        methods = protocol.get("methods") if isinstance(protocol.get("methods"), Mapping) else {}
+        configured = methods.get(method) if isinstance(methods.get(method), Mapping) else {}
+        countries = configured.get("stage_proxy_countries") if isinstance(configured.get("stage_proxy_countries"), Mapping) else {}
+        canonical = str(countries.get("checkout") or configured.get("checkout_country") or "").strip().upper()
+        if canonical:
+            return canonical
+    except Exception:
+        pass
     spec = PAYMENT_METHODS.get(method)
     return spec.country if spec else "US"
 
@@ -262,7 +274,10 @@ def resolve_payment_route(
 ) -> dict[str, Any]:
     """Compile one immutable route plan before authentication starts."""
     proxy, checkout_proxy, provider_proxy, approve_proxy = context.payment_stage_args(args, payment_method)
-    countries = context.stage_country_overrides(args, payment_method)
+    # The desktop proxy-pool workflow deliberately does not accept a manual
+    # exit-country override.  The planner derives the required country from
+    # the payment method and probes the pool before any side effect.
+    countries = {} if getattr(args, "auto_proxy_country", False) else context.stage_country_overrides(args, payment_method)
     target_country = context.payment_country(payment_method, getattr(args, "target_country", ""))
     checkout_country = str(getattr(args, "checkout_country", "") or target_country).strip().upper()
     promotion_proxy = context.promotion_proxy_arg(args, payment_method)
@@ -294,6 +309,7 @@ def resolve_payment_route(
         "checkout_proxy_pool": stage_pools["checkout"],
         "approve_proxy_pool": stage_pools["approve"],
         "use_protocol_proxy_pool": True,
+        "auto_proxy_country": bool(getattr(args, "auto_proxy_country", False)),
     }
     explicit_stages: dict[str, Any] = {}
     if not stage_pools["checkout"] and checkout_proxy:
@@ -414,10 +430,48 @@ def resolve_access_token(args: Any, *, stderr: Any = None) -> tuple[str, Any]:
     return access_token, data
 
 
+def _method_dependency_map() -> dict[str, tuple[str, ...]]:
+    """Importable packages each payment method's adapter requires (offline probe)."""
+    curl = ("curl_cffi",)
+    return {
+        "paypal": curl,
+        "upi": ("curl_cffi", "qrcode", "PIL"),
+        "ideal": curl,
+        "pix": curl,
+        "kakao": curl,
+        "blik": curl,
+        "twint": curl,
+        "direct_card": curl,
+        "momo": curl,
+        "gopay": curl,
+        "gcash": curl,
+        "grabpay": curl,
+    }
+
+
+def _probe_dependencies(packages: tuple[str, ...]) -> dict[str, bool]:
+    from importlib.util import find_spec
+
+    available = {}
+    for package in packages:
+        try:
+            available[package] = find_spec(package) is not None
+        except (ImportError, ValueError):
+            available[package] = False
+    return available
+
+
 def list_payment_methods() -> None:
     from ..payment_link_manager import supported_payment_methods
 
-    print(json.dumps({"ok": True, "methods": supported_payment_methods()}, ensure_ascii=False, indent=2))
+    methods = supported_payment_methods()
+    dependency_map = _method_dependency_map()
+    for method in methods:
+        if isinstance(method, dict):
+            key = str(method.get("key") or "").strip().lower()
+            if key in dependency_map:
+                method["dependencies"] = _probe_dependencies(dependency_map[key])
+    print(json.dumps({"ok": True, "methods": methods}, ensure_ascii=False, indent=2))
 
 
 def test_payment_proxies(args: Any, context: PaymentCommandContext) -> None:
@@ -429,13 +483,16 @@ def test_payment_proxies(args: Any, context: PaymentCommandContext) -> None:
         select_proxy_from_pool,
     )
     from ..config import current_config_data
-    from ..payment_country_catalog import is_paypal_supported, paypal_country_requires_validation
 
     proxy_state = proxy_state_from_config(current_config_data())
+    # This is an interactive diagnostic, not a payment attempt. Keep each
+    # network leg bounded so a dead proxy cannot leave the modal apparently
+    # frozen for several minutes across scheme and provider fallbacks.
+    probe_timeout = 3.0
     method = context.payment_method(args)
     proxy, checkout_proxy, _, approve_proxy = context.payment_stage_args(args, method)
     promotion_proxy = context.promotion_proxy_arg(args, method)
-    countries = context.stage_country_overrides(args, method)
+    countries = {} if getattr(args, "auto_proxy_country", False) else context.stage_country_overrides(args, method)
     default_country = context.payment_country(method, getattr(args, "target_country", ""))
     pool = context.protocol_proxy_pool()
     configured_pools = (
@@ -464,16 +521,23 @@ def test_payment_proxies(args: Any, context: PaymentCommandContext) -> None:
     stages: dict[str, Any] = {}
     for stage, proxy in stage_values.items():
         expected = countries.get(stage_country_keys[stage], "") or default_country
+        # GoPay's promotion stage is a provider contract rather than a user
+        # setting; retain the canonical backend rule in automatic mode.
+        if getattr(args, "auto_proxy_country", False) and method == "gopay":
+            if stage == "approve":
+                expected = "JP"
+            elif stage == "update":
+                expected = "TH"
         candidate = proxy or ""
         attempts = []
         result = None
-        stage_pool = stage_pools.get(stage if stage != "update" else "") or (
+        stage_pool = stage_pools.get("approve" if stage in {"approve", "update"} else "checkout") or (
             pool if use_pool else []
         )
-        paypal_country_checked = paypal_country_requires_validation(method)
-        expected_country_supported = (not paypal_country_checked) or (not expected) or is_paypal_supported(expected)
         if stage_pool:
-            candidate, attempts = select_proxy_from_pool(stage_pool, expected, stage, state=proxy_state)
+            candidate, attempts = select_proxy_from_pool(
+                stage_pool, expected, stage, state=proxy_state, timeout=probe_timeout
+            )
             if not candidate:
                 stages[stage] = {
                     "ok": False,
@@ -481,28 +545,31 @@ def test_payment_proxies(args: Any, context: PaymentCommandContext) -> None:
                     "expected_country": expected,
                     "error": "payment_proxy_pool_unavailable",
                     "proxy": "DIRECT",
-                    "expected_country_paypal_supported": expected_country_supported,
                     "attempts": attempts,
                 }
                 continue
             stages[stage] = {
                 **attempts[-1],
                 "proxy": redact_proxy_url(candidate),
-                "expected_country_paypal_supported": expected_country_supported,
                 "attempts": attempts,
             }
             continue
-        for attempt in range(1, 4):
+        for attempt in range(1, 3):
             if attempt > 1 and candidate:
                 candidate = rotate_proxy_session(candidate, expected)
-            result = probe_proxy(candidate, expected_country=expected, stage=stage, state=proxy_state)
+            result = probe_proxy(
+                candidate,
+                expected_country=expected,
+                stage=stage,
+                state=proxy_state,
+                timeout=probe_timeout,
+            )
             attempts.append({"attempt": attempt, "ok": result.ok, "error": result.error})
             if result.ok:
                 break
         stages[stage] = {
             **result.to_dict(),
             "proxy": redact_proxy_url(candidate),
-            "expected_country_paypal_supported": expected_country_supported,
             "attempts": attempts,
         }
     ok = all(bool(item.get("ok")) for item in stages.values())
@@ -521,13 +588,16 @@ def test_payment_proxies(args: Any, context: PaymentCommandContext) -> None:
 
 def extract_payment_link(args: Any, context: PaymentCommandContext) -> None:
     """Extract a supported protocol payment link from an AT or saved account."""
-    from ..desktop_ipc import emit_result
+    from ..desktop_ipc import emit_event, emit_result
     from ..payment_link_manager import generate_payment_link
 
     def output(payload: Any) -> None:
         emit_result(payload, enabled=bool(getattr(args, "desktop_ipc", False)))
 
     method = context.payment_method(args)
+
+    def payment_progress(event: Mapping[str, Any]) -> None:
+        emit_event({"domain": "payment", **dict(event or {})})
 
     def selected_route() -> dict[str, Any]:
         try:
@@ -557,6 +627,14 @@ def extract_payment_link(args: Any, context: PaymentCommandContext) -> None:
         if not emails:
             output({"ok": False, "error": "email file contains no accounts"})
             raise SystemExit(1)
+        token_map = {}
+        token_map_file = str(getattr(args, "payment_token_map", None) or "").strip()
+        if token_map_file:
+            try:
+                loaded = json.loads(Path(token_map_file).read_text(encoding="utf-8-sig"))
+                token_map = loaded if isinstance(loaded, dict) else {}
+            except (OSError, ValueError, TypeError):
+                token_map = {}
         route = selected_route()
         payment_kwargs = {
             "checkout_proxy": route["checkout_proxy"],
@@ -570,6 +648,7 @@ def extract_payment_link(args: Any, context: PaymentCommandContext) -> None:
             "redirect_proxy": getattr(args, "redirect_proxy", None),
             "promotion_proxy": route["promotion_proxy"],
             "stage_proxy_countries": route["stage_countries"],
+            "auto_proxy_country": bool(getattr(args, "auto_proxy_country", False)),
             "target_country": route["target_country"],
             "checkout_country": route["checkout_country"],
             "require_zero": not getattr(args, "no_require_zero", False),
@@ -586,8 +665,11 @@ def extract_payment_link(args: Any, context: PaymentCommandContext) -> None:
                 probe_only=bool(getattr(args, "payment_probe_only", False)),
                 matrix=getattr(args, "payment_matrix", None),
                 canary=getattr(args, "payment_canary", 0),
-                retries=getattr(args, "payment_retries", 1),
+                retries=getattr(args, "payment_retries", 3),
                 timeout=getattr(args, "refresh_timeout", 30),
+                progress=payment_progress,
+                access_tokens=token_map,
+                resume_checkpoint=bool(getattr(args, "payment_resume_checkpoint", False)),
             )
         except RuntimeError as exc:
             output({"ok": False, "error": str(exc)})
@@ -654,6 +736,7 @@ def extract_payment_link(args: Any, context: PaymentCommandContext) -> None:
         "redirect_proxy": getattr(args, "redirect_proxy", None),
         "promotion_proxy": route["promotion_proxy"],
         "stage_proxy_countries": route["stage_countries"],
+        "auto_proxy_country": bool(getattr(args, "auto_proxy_country", False)),
         "require_zero": not getattr(args, "no_require_zero", False),
         "probe_only": bool(getattr(args, "payment_probe_only", False)),
     }
@@ -675,8 +758,23 @@ def extract_payment_link(args: Any, context: PaymentCommandContext) -> None:
         payment_method=method,
         auth_context=auth_context,
         paypal_generation_type=getattr(args, "paypal_generation_type", None),
+        progress=payment_progress,
         **kwargs,
     )
+    if method == "paypal" and result.get("ok") and result.get("url"):
+        try:
+            from ..paypal_authorization_queue import enqueue_paypal_ba_authorization
+
+            queued = enqueue_paypal_ba_authorization(
+                email=str(getattr(args, "email", None) or ""),
+                approval_url=str(result.get("url") or ""),
+                batch_id=str(getattr(args, "payment_batch_id", None) or ""),
+            )
+            result["authorization_queued"] = True
+            result["authorization_queue_id"] = queued.get("id", "")
+            result["authorization_status"] = queued.get("status", "pending")
+        except ValueError:
+            pass
     print(json.dumps(result, ensure_ascii=False, indent=2))
     if not result.get("ok"):
         raise SystemExit(3)

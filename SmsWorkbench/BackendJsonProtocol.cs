@@ -6,7 +6,7 @@ namespace SmsWorkbench
     {
         private static readonly string[] LineSeparators = { "\r\n", "\n" };
 
-        public const string Prefix = "@@SMSWORKBENCH_IPC_V1@@";
+        public const string Prefix = "@@SMSWORKBENCH_V2@@";
 
         public static JsonElement? ExtractPayload(string standardOutput)
         {
@@ -21,7 +21,9 @@ namespace SmsWorkbench
                 using JsonDocument envelope = JsonDocument.Parse(envelopeJson);
                 JsonElement root = envelope.RootElement;
                 if (root.TryGetProperty("version", out JsonElement version)
-                    && version.GetInt32() == 1
+                    && version.GetInt32() == 2
+                    && root.TryGetProperty("schema", out JsonElement schema)
+                    && string.Equals(schema.GetString(), "smsworkbench.ipc.v2", StringComparison.Ordinal)
                     && root.TryGetProperty("type", out JsonElement type)
                     && string.Equals(type.GetString(), "result", StringComparison.Ordinal)
                     && root.TryGetProperty("payload", out JsonElement payload))
@@ -37,8 +39,14 @@ namespace SmsWorkbench
         private static JsonElement? ExtractLegacyPayload(string standardOutput)
         {
             string value = (standardOutput ?? "").Trim();
+            // The trailing JSON (if any) parses on the first attempt; the loop
+            // only keeps scanning when the tail holds no complete object, so
+            // bound the attempts to avoid quadratic parsing on brace-heavy logs.
+            const int maxAttempts = 200;
+            int attempts = 0;
             for (int start = value.LastIndexOf('{'); start >= 0; start = value.LastIndexOf('{', start - 1))
             {
+                if (++attempts > maxAttempts) break;
                 try
                 {
                     using JsonDocument document = JsonDocument.Parse(value.Substring(start));

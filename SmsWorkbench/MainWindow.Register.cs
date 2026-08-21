@@ -183,7 +183,10 @@ namespace SmsWorkbench
             args.Add("--no-phone-reuse");
         }
 
-        private async void OneClickSms_Click(object sender, RoutedEventArgs e)
+        private void OneClickSms_Click(object sender, RoutedEventArgs e)
+            => RunUiTask(OneClickSmsAsync);
+
+        private async Task OneClickSmsAsync()
         {
             var rows = SelectedEmailRowsOrNotify("接码");
             if (rows.Count == 0) return;
@@ -251,13 +254,15 @@ namespace SmsWorkbench
                 options.Workers,
                 options.AutoRelogin,
                 GetLivenessProxyPool());
-            RunBackend(plan.TaskName, plan.Arguments.ToList());
+            RunAccountBatchBackend(plan.TaskName, plan.Arguments.ToList(), "account_scan", rows.Count);
         }
 
         private void CheckPromotion_Click(object sender, RoutedEventArgs e)
         {
             var rows = SelectedRowsOrCurrent()
                 .Where(r => r != null && !string.IsNullOrWhiteSpace(r.Identifier))
+                .GroupBy(r => r.Identifier.Trim(), StringComparer.OrdinalIgnoreCase)
+                .Select(group => group.First())
                 .ToList();
             if (rows.Count == 0)
             {
@@ -269,7 +274,7 @@ namespace SmsWorkbench
                 rows.Select(r => r.Identifier.Trim()).ToList(),
                 DefaultWorkerCount(),
                 GetLivenessProxyPool());
-            RunBackend(plan.TaskName, plan.Arguments.ToList());
+            RunAccountBatchBackend(plan.TaskName, plan.Arguments.ToList(), "account_promotion", rows.Count);
         }
 
         private ScanOptions ShowScanOptionsDialog(int accountCount)
@@ -407,6 +412,13 @@ namespace SmsWorkbench
 
         private RegisterOptions ShowSelectedRegisterOptionsDialog(int selectedCount)
         {
+            RegisterOptions selected = null;
+            Window dialog = CreateSelectedRegisterOptionsDialog(selectedCount, options => selected = options);
+            return dialog.ShowDialog() == true ? selected : null;
+        }
+
+        private Window CreateSelectedRegisterOptionsDialog(int selectedCount, Action<RegisterOptions> accept)
+        {
             var dialog = new Window
             {
                 Title = "选中邮箱注册",
@@ -478,10 +490,9 @@ namespace SmsWorkbench
             Grid.SetColumnSpan(actions, 2);
             root.Children.Add(actions);
 
-            RegisterOptions selected = null;
             ok.Click += (_, __) =>
             {
-                selected = new RegisterOptions
+                var selected = new RegisterOptions
                 {
                     Source = "pool",
                     Count = Math.Max(1, selectedCount),
@@ -489,15 +500,23 @@ namespace SmsWorkbench
                     Disable2fa = no2faBox.IsChecked == true,
                     CheckPromotion = promotionBox.IsChecked == true
                 };
+                accept(selected);
                 dialog.DialogResult = true;
                 dialog.Close();
             };
             cancel.Click += (_, __) => { dialog.DialogResult = false; dialog.Close(); };
             dialog.Content = root;
-            return dialog.ShowDialog() == true ? selected : null;
+            return dialog;
         }
 
         private RegisterOptions ShowRegisterOptionsDialog()
+        {
+            RegisterOptions selected = null;
+            Window dialog = CreateRegisterOptionsDialog(options => selected = options);
+            return dialog.ShowDialog() == true ? selected : null;
+        }
+
+        private Window CreateRegisterOptionsDialog(Action<RegisterOptions> accept)
         {
             var dialog = new Window
             {
@@ -593,13 +612,12 @@ namespace SmsWorkbench
             Grid.SetColumnSpan(actions, 2);
             root.Children.Add(actions);
 
-            RegisterOptions selected = null;
             ok.Click += (_, __) =>
             {
                 int count = ParsePositiveInt(countBox.Text, 1, 200, 1);
                 int workers = ParsePositiveInt(workerBox.Text, 1, 20, DefaultWorkerCount());
                 string selectedSource = ((sourceBox.SelectedItem as ComboBoxItem)?.Tag as string) ?? "pool";
-                selected = new RegisterOptions
+                var selected = new RegisterOptions
                 {
                     Source = selectedSource,
                     Count = count,
@@ -607,13 +625,14 @@ namespace SmsWorkbench
                     Disable2fa = no2faBox.IsChecked == true,
                     CheckPromotion = promotionBox.IsChecked == true
                 };
+                accept(selected);
                 CountText = count.ToString();
                 dialog.DialogResult = true;
                 dialog.Close();
             };
             cancel.Click += (_, __) => { dialog.DialogResult = false; dialog.Close(); };
             dialog.Content = root;
-            return dialog.ShowDialog() == true ? selected : null;
+            return dialog;
         }
 
         private int ParsePositiveInt(string text, int min, int max, int fallback)

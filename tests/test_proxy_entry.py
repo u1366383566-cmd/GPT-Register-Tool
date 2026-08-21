@@ -14,6 +14,9 @@ from sms_tool.proxy_entry import (
     parse_proxy,
     parse_proxy_list,
     proxy_to_url,
+    infer_region,
+    retarget_region,
+    rotate_session,
     resolve_proxy_value,
 )
 
@@ -190,6 +193,24 @@ class TestProxyEntryClass(unittest.TestCase):
         self.assertIn("label", d)
 
 
+class TestIpwoCountryTemplate(unittest.TestCase):
+    def test_infers_custom_zone_country(self):
+        proxy = "http://account_custom_zone_US:password@us.ipwo.net:7878"
+        self.assertEqual(infer_region(proxy), "US")
+
+    def test_retargets_custom_zone_country(self):
+        proxy = "http://account_custom_zone_US:password@us.ipwo.net:7878"
+        retargeted = retarget_region(proxy, "JP")
+        self.assertIn("custom_zone_JP", retargeted)
+        self.assertEqual(infer_region(retargeted), "JP")
+
+    def test_rotation_retargets_country_without_requiring_session_token(self):
+        proxy = "http://account_custom_zone_US:password@us.ipwo.net:7878"
+        rotated = rotate_session(proxy, "GB")
+        self.assertIn("custom_zone_GB", rotated)
+        self.assertEqual(infer_region(rotated), "GB")
+
+
 class TestResolveProxyValue(unittest.TestCase):
     """--proxy single-value resolution (pool / bare credential / URL)."""
 
@@ -208,6 +229,10 @@ class TestResolveProxyValue(unittest.TestCase):
             resolve_proxy_value("gate.kookeey.info:1000:user:pass-JP"),
             "http://user:pass-JP@gate.kookeey.info:1000",
         )
+
+    def test_bare_credential_accepts_full_width_colons(self):
+        entry = parse_proxy("gate.example:8080：user：pass")
+        self.assertEqual(entry.url, "http://user:pass@gate.example:8080")
 
     def test_pool_picks_first_usable(self):
         self.assertEqual(

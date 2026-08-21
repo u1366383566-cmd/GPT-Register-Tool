@@ -10,6 +10,7 @@ namespace SmsWorkbench
         private readonly IDesktopReadClient desktopRead;
         private readonly Serilog.ILogger logger;
         private readonly IPaymentBatchDialogService paymentBatchDialogs;
+        private readonly IProtocolPaymentDialogService protocolPaymentDialogs;
         private readonly Wpf.Ui.ISnackbarService snackbarService;
         private readonly ISettingsDialogService settingsDialogs;
         private readonly ISettingsService settingsService;
@@ -192,6 +193,7 @@ namespace SmsWorkbench
             IBackendTaskCoordinator backendTasks,
             IDesktopReadClient desktopRead,
             IPaymentBatchDialogService paymentBatchDialogs,
+            IProtocolPaymentDialogService protocolPaymentDialogs,
             IPaymentBatchService paymentBatchService,
             Wpf.Ui.ISnackbarService snackbarService,
             ISettingsDialogService settingsDialogs,
@@ -202,6 +204,7 @@ namespace SmsWorkbench
             this.backendTasks = backendTasks;
             this.desktopRead = desktopRead;
             this.paymentBatchDialogs = paymentBatchDialogs;
+            this.protocolPaymentDialogs = protocolPaymentDialogs;
             this.paymentBatchService = paymentBatchService;
             this.snackbarService = snackbarService;
             this.settingsDialogs = settingsDialogs;
@@ -220,6 +223,32 @@ namespace SmsWorkbench
             ScopeFilter = "全部";
             RefreshPools();
             ApplySidebarCompact(false);
+        }
+
+        internal MainWindow(
+            IApplicationPaths paths,
+            IBackendClient backendClient,
+            IBackendTaskCoordinator backendTasks,
+            IDesktopReadClient desktopRead,
+            IPaymentBatchDialogService paymentBatchDialogs,
+            IPaymentBatchService paymentBatchService,
+            Wpf.Ui.ISnackbarService snackbarService,
+            ISettingsDialogService settingsDialogs,
+            ISettingsService settingsService,
+            Serilog.ILogger logger)
+            : this(
+                paths,
+                backendClient,
+                backendTasks,
+                desktopRead,
+                paymentBatchDialogs,
+                null,
+                paymentBatchService,
+                snackbarService,
+                settingsDialogs,
+                settingsService,
+                logger)
+        {
         }
 
         // Moved to MainWindow.Pools.cs: Pool/session loading, filtering, overview.
@@ -251,16 +280,11 @@ namespace SmsWorkbench
         public string Identifier { get; set; } = "";
         public string AccountType { get; set; } = "";
         public string AccountPlanType { get; set; } = "";
+        public string Source { get; set; } = "";
+        public string RegisterMethod { get; set; } = "";
+        public string SessionType { get; set; } = "";
+        public string PlanType { get; set; } = "";
         public string RegistrationCountry { get; set; } = "";
-        public string QuotaStatus { get; set; } = "";
-        public string Quota5hUsed { get; set; } = "";
-        public string Quota5hLimit { get; set; } = "";
-        public string Quota5hRemaining { get; set; } = "";
-        public string Quota5hPercent { get; set; } = "";
-        public string Quota7dUsed { get; set; } = "";
-        public string Quota7dLimit { get; set; } = "";
-        public string Quota7dRemaining { get; set; } = "";
-        public string Quota7dPercent { get; set; } = "";
         public string Status { get; set; } = "";
         public string PayPalStatus { get; set; } = "";
         public string PayPalAmount { get; set; } = "";

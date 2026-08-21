@@ -306,6 +306,10 @@ class RegistrationEmailWorkflow:
         r = self.r
         return {
             "email": s.username,
+            "source": "register",
+            "register_method": "email" if s.registration_mode != "phone" else "phone",
+            "session_type": "at_only" if s.registration_mode == "at_only" else "web",
+            "plan_type": "unknown",
             "success": False,
             "status": "at_probe_pending",
             "password": s.password,
@@ -490,6 +494,9 @@ class RegistrationEmailWorkflow:
         if s.proxy:
             s.session.proxies = {"http": s.proxy, "https": s.proxy}
         if s.registration_mode == "passwordless":
+            # Keep the Web/NextAuth flow isolated from the Sentinel extraction
+            # prime session. Importing its auth.openai.com login cookies creates
+            # a stale login transaction and routes authorize to /log-in/password.
             r._set_oai_did_cookie(s.session, s.device_id)
         else:
             r._import_sentinel_cookies(s.session, s.sentinel_data, s.device_id)
@@ -541,11 +548,17 @@ class RegistrationEmailWorkflow:
             sentinel_token=s.sentinel_token,
             authorize_sentinel_token=s.sentinel_authorize_token,
             sentinel_so_token=s.sentinel_so_token,
+            proxy=s.proxy,
+            passwordless_web=s.registration_mode == "passwordless",
             attempts=r._passwordless_signin_attempts() if s.registration_mode == "passwordless" else r._signup_signin_attempts(),
         )
         r._fetch_client_auth_session_dump(s.session, s.auth_base, s.base_headers, "after_signup_state")
-        if s.signup_state.get("existing_login_redirect"):
-            self._abort("email_already_registered_or_login_redirect")
+        if int(s.signup_state.get("status") or 0) == 429:
+            from .registration_concurrency import mark_registration_rate_limited
+
+            retry_after = float(s.signup_state.get("retry_after_seconds") or 300)
+            mark_registration_rate_limited(retry_after)
+            self._abort(f"registration_rate_limited:retry_after={retry_after:.0f}s")
         if not s.signup_state.get("ok"):
             self._abort(f"signup_auth_state:{json.dumps(s.signup_state, ensure_ascii=False)[:300]}")
         if r._is_chatgpt_auth_login_landing(s.signup_state.get("url", "")):
@@ -555,7 +568,8 @@ class RegistrationEmailWorkflow:
     def user_register(self) -> None:
         r = self.r
         s = self.runtime
-        if s.registration_mode == "passwordless":
+        password_fallback = bool(s.signup_state.get("password_fallback")) or r._is_signup_password_step(s.signup_state.get("url", ""))
+        if s.registration_mode == "passwordless" and not password_fallback:
             s.reg_data = {
                 "mode": "passwordless_signup",
                 "auth_state": {
@@ -605,19 +619,15 @@ class RegistrationEmailWorkflow:
             s.resume_email_verification,
         )
         otp_send_started = int(time.time())
-        if s.registration_mode == "passwordless":
-            r._prime_email_verification_page(
-                s.session,
-                s.auth_base,
-                s.base_headers,
-                s.signup_state.get("url", ""),
-            )
-            response = r._send_registration_email_otp(
-                s.session,
-                s.auth_base,
-                s.base_headers,
-                current_url=s.signup_state.get("url", ""),
-                mode="passwordless",
+        password_fallback = bool(s.signup_state.get("password_fallback")) or r._is_signup_password_step(s.signup_state.get("url", ""))
+        if s.registration_mode == "passwordless" and not password_fallback:
+            # authorize with login_hint sends the first OTP itself. Do not
+            # immediately POST resend: that endpoint is rate-limited for this
+            # flow and the reference browser path only polls the pre-sent code.
+            response = r.SyntheticResponse(
+                204,
+                {"assumed_pre_sent": True},
+                url=s.signup_state.get("url", ""),
             )
         else:
             response = r._follow_continue_url(
@@ -951,7 +961,7 @@ class RegistrationEmailWorkflow:
         r = self.r
         s = self.runtime
         from .auth_headers import current_auth_fingerprint
-        from .payment_auth import access_token_telemetry
+        from .token_telemetry import access_token_telemetry
         from .paypal_proxy import infer_proxy_country
         from .sentinel_quickjs import sentinel_version
 
@@ -961,6 +971,10 @@ class RegistrationEmailWorkflow:
             "success": s.success,
             "error": r._sanitize_text(s.error),
             "email": s.username,
+            "source": "register",
+            "register_method": "email" if s.registration_mode != "phone" else "phone",
+            "session_type": "at_only" if s.registration_mode == "at_only" else "web",
+            "plan_type": "unknown",
             "phone": s.phone_result.get("phone", "") if s.phone_result.get("ok") else "",
             "password": "" if s.password_unknown else s.password,
             "name": s.full_name,

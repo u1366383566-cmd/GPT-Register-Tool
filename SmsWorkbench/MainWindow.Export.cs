@@ -107,8 +107,12 @@ namespace SmsWorkbench
         }
 
         private void ExportAccountsJson(List<PoolRow> rows)
+            => RunUiTask(() => ExportAccountsJsonAsync(rows));
+
+        private async Task ExportAccountsJsonAsync(List<PoolRow> rows)
         {
-            if (!TryCollectAccountExportJson(rows, out List<Dictionary<string, object>> items, out int skipped))
+            var collected = await CollectAccountExportJsonAsync(rows);
+            if (collected.Items.Count == 0)
             {
                 ShowThemedInfoDialog("一键导出", "没有找到可导出的 JSON 账号记录。需要账号已生成 session/auth_session 或 SQLite 原始记录。");
                 return;
@@ -117,21 +121,24 @@ namespace SmsWorkbench
             string outputDir = Path.Combine(rootDir, "runtime", "account_json");
             Directory.CreateDirectory(outputDir);
             string outputPath = Path.Combine(outputDir, "account-" + DateTime.Now.ToString("yyyyMMdd_HHmmss") + ".json");
-            object payload = items.Count == 1 ? items[0] : items;
+            object payload = collected.Items.Count == 1 ? collected.Items[0] : collected.Items;
             var options = new JsonSerializerOptions { WriteIndented = true };
-            File.WriteAllText(outputPath, JsonSerializer.Serialize(payload, options), new UTF8Encoding(false));
-            Log("One-click JSON export wrote " + items.Count + " account(s), skipped " + skipped + ": " + outputPath);
-            ShowExportCompleteDialog(outputPath, items.Count, skipped, "JSON", "原始账号 session JSON；保留 RT 字段，未获取 RT 的账号默认留空");
+            await Task.Run(() => File.WriteAllText(outputPath, JsonSerializer.Serialize(payload, options), new UTF8Encoding(false)));
+            Log("One-click JSON export wrote " + collected.Items.Count + " account(s), skipped " + collected.Skipped + ": " + outputPath);
+            ShowExportCompleteDialog(outputPath, collected.Items.Count, collected.Skipped, "JSON", "原始账号 session JSON；保留 RT 字段，未获取 RT 的账号默认留空");
         }
 
-        private bool TryCollectAccountExportJson(List<PoolRow> rows, out List<Dictionary<string, object>> items, out int skipped)
+        private sealed record CollectedAccountExport(List<Dictionary<string, object>> Items, int Skipped);
+
+        private async Task<CollectedAccountExport> CollectAccountExportJsonAsync(List<PoolRow> rows)
         {
-            items = new List<Dictionary<string, object>>();
+            var items = new List<Dictionary<string, object>>();
             var seen = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
-            skipped = 0;
+            int skipped = 0;
             foreach (PoolRow row in rows)
             {
-                if (TryBuildAccountExportJson(row, out Dictionary<string, object> item))
+                Dictionary<string, object> item = await BuildAccountExportJsonAsync(row);
+                if (item != null)
                 {
                     string key = JsonExportDedupKey(item, row);
                     if (seen.Add(key))
@@ -144,16 +151,22 @@ namespace SmsWorkbench
                     skipped++;
                 }
             }
-            return items.Count > 0;
+            return new CollectedAccountExport(items, skipped);
         }
 
         private void ExportAccountsConvertedJson(List<PoolRow> rows, string format)
+            => RunUiTask(() => ExportAccountsConvertedJsonAsync(rows, format));
+
+        private async Task ExportAccountsConvertedJsonAsync(List<PoolRow> rows, string format)
         {
-            if (!TryCollectAccountExportJson(rows, out List<Dictionary<string, object>> items, out int skipped))
+            var collected = await CollectAccountExportJsonAsync(rows);
+            if (collected.Items.Count == 0)
             {
                 ShowThemedInfoDialog("一键导出", "没有找到可转换的账号 session。需要账号已生成 access_token/session/auth_session 或 SQLite 原始记录。");
                 return;
             }
+            List<Dictionary<string, object>> items = collected.Items;
+            int skipped = collected.Skipped;
 
             string normalized = (format ?? "cpa").Trim().ToLowerInvariant();
             string outputDir = Path.Combine(rootDir, "runtime", "account_json");
@@ -163,12 +176,12 @@ namespace SmsWorkbench
             string outputPath = Path.Combine(outputDir, "account-" + normalized + "-" + stamp + ".json");
             object payload = items.Count == 1 ? items[0] : items;
             var options = new JsonSerializerOptions { WriteIndented = true };
-            File.WriteAllText(sourcePath, JsonSerializer.Serialize(payload, options), new UTF8Encoding(false));
+            await Task.Run(() => File.WriteAllText(sourcePath, JsonSerializer.Serialize(payload, options), new UTF8Encoding(false)));
 
             try
             {
                 var plan = BackendCommandPlanner.CreateSessionConversion(sourcePath, normalized, outputPath);
-                RunBackendWithResult(plan.TaskName, plan.Arguments.ToList());
+                await RunBackendWithResultAsync(plan.TaskName, plan.Arguments.ToList());
             }
             catch (Exception ex)
             {
@@ -705,13 +718,13 @@ namespace SmsWorkbench
             return text.Equals("true", StringComparison.OrdinalIgnoreCase) || text == "1";
         }
 
-        private bool TryBuildAccountExportJson(PoolRow row, out Dictionary<string, object> item)
+        private async Task<Dictionary<string, object>> BuildAccountExportJsonAsync(PoolRow row)
         {
-            item = null;
-            if (row == null) return false;
-            if (!TryLoadAccountDataForRow(row, out Dictionary<string, object> data) || data.Count == 0)
+            if (row == null) return null;
+            var data = new Dictionary<string, object>(StringComparer.OrdinalIgnoreCase);
+            if (!await TryLoadAccountDataForRowAsync(row, data) || data.Count == 0)
             {
-                return false;
+                return null;
             }
 
             Dictionary<string, object> source = data;
@@ -722,7 +735,7 @@ namespace SmsWorkbench
 
             if (CloneExportJsonValue(source) is not Dictionary<string, object> clean || clean.Count == 0)
             {
-                return false;
+                return null;
             }
 
             EnsureJsonExportEmail(clean, row);
@@ -732,22 +745,23 @@ namespace SmsWorkbench
                 SetJsonExportPlanTypePlus(clean);
             }
 
-            item = clean;
-            return true;
+            return clean;
         }
 
-        private bool TryLoadAccountDataForRow(PoolRow row, out Dictionary<string, object> data)
+        private async Task<bool> TryLoadAccountDataForRowAsync(PoolRow row, Dictionary<string, object> data)
         {
-            data = new Dictionary<string, object>(StringComparer.OrdinalIgnoreCase);
             if (row == null) return false;
 
             string source = (row.SourcePath ?? "").Trim();
             if (!source.EndsWith(".sqlite3", StringComparison.OrdinalIgnoreCase) || !File.Exists(source)) return false;
             try
             {
-                JsonElement account = desktopRead.ReadAccountExportAsync(
-                    OnlyDigits(row.RawLine), row.Identifier).GetAwaiter().GetResult();
-                data = BackendJson.ElementToDictionary(account);
+                JsonElement account = await desktopRead.ReadAccountExportAsync(
+                    OnlyDigits(row.RawLine), row.Identifier);
+                foreach (KeyValuePair<string, object> item in BackendJson.ElementToDictionary(account))
+                {
+                    data[item.Key] = item.Value;
+                }
                 return data.Count > 0;
             }
             catch (Exception ex)

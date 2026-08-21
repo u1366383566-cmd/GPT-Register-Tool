@@ -5,6 +5,8 @@ from pathlib import Path
 from unittest.mock import Mock, patch
 
 from sms_tool import account_creation, auth_flow, batch_runner, otp_strategy, registration
+from sms_tool.auth_flow import _ensure_authorize_context
+from sms_tool.auth_flow import _protocol_diagnostic
 from sms_tool.mailbox import _parse_chatai_mailbox_file
 from sms_tool.registration import (
     _create_account_continue_url,
@@ -33,6 +35,11 @@ from sms_tool.registration import (
 
 
 class RegistrationConcurrencyTests(unittest.TestCase):
+    def test_protocol_diagnostic_redacts_query_parameters(self):
+        diagnostic = _protocol_diagnostic(final_url="https://auth.openai.com/email-verification?state=secret&code=secret")
+        self.assertEqual(diagnostic["final_url"], "https://auth.openai.com/email-verification")
+        self.assertNotIn("secret", str(diagnostic))
+
     def test_stability_probe_uses_registration_proxy_and_releases_gate_while_waiting(self):
         stages = []
         with patch.object(registration, "CFG", {"registration": {
@@ -91,6 +98,7 @@ class RegistrationConcurrencyTests(unittest.TestCase):
             "/api/accounts/authorize?prompt=login&screen_hint=signup"
         ))
         self.assertTrue(_is_existing_login_redirect("https://auth.openai.com/log-in"))
+        self.assertFalse(_is_existing_login_redirect("https://example.com/login"))
         self.assertTrue(_is_chatgpt_auth_login_landing("https://chatgpt.com/auth/login?callbackUrl=https%3A%2F%2Fchatgpt.com%2F"))
         self.assertTrue(_is_signup_password_step("https://auth.openai.com/create-account/password"))
         self.assertFalse(_is_signup_password_step("https://chatgpt.com/auth/login"))
@@ -117,12 +125,112 @@ class RegistrationConcurrencyTests(unittest.TestCase):
         self.assertIn("login_hint=a%2Boai01%40hotmail.com", url)
         self.assertNotIn("prompt=login", url)
 
+    def test_signup_login_redirect_advances_username_instead_of_aborting(self):
+        signin_response = Mock()
+        signin_response.status_code = 200
+        signin_response.json.return_value = {"url": "https://auth.openai.com/api/accounts/authorize"}
+        signin_response.headers = {}
+        signin_response.url = "https://chatgpt.com/api/auth/signin/openai"
+
+        authorize_response = Mock()
+        authorize_response.status_code = 302
+        authorize_response.headers = {"location": "/log-in"}
+        authorize_response.url = "https://auth.openai.com/api/accounts/authorize"
+
+        session = Mock()
+        session.post.return_value = signin_response
+        session.get.return_value = authorize_response
+        advanced = {
+            "ok": True,
+            "status": 200,
+            "url": "https://auth.openai.com/email-verification",
+        }
+
+        with patch.object(auth_flow, "_continue_signup_username", return_value=advanced) as continue_signup:
+            state = auth_flow._prepare_signup_auth_state(
+                session,
+                "user@example.com",
+                "device-id",
+                "logging-id",
+                "https://auth.openai.com",
+                "https://chatgpt.com",
+                {},
+                "csrf-token",
+                attempts=({"name": "login_or_signup", "screen_hint": "login_or_signup", "prompt": ""},),
+            )
+
+        self.assertTrue(state["ok"])
+        self.assertTrue(state["login_redirect_seen"])
+        continue_signup.assert_called_once()
+
     def test_passwordless_signin_primary_attempt_matches_har_login_or_signup(self):
         attempts = _passwordless_signin_attempts()
 
         self.assertEqual(attempts[0]["name"], "login_or_signup")
         self.assertEqual(attempts[0]["screen_hint"], "login_or_signup")
         self.assertEqual(attempts[0]["prompt"], "")
+
+    def test_authorize_url_preserves_current_browser_context_parameters(self):
+        url = _ensure_authorize_context(
+            "https://auth.openai.com/api/accounts/authorize?state=state-1",
+            "did-1", "logging-1", "user@example.com",
+            screen_hint="login_or_signup",
+        )
+        self.assertIn("ext-passkey-client-capabilities=11111", url)
+        self.assertIn("ccaps=login_methods", url)
+        self.assertIn("device_id=did-1", url)
+        self.assertIn("ext-oai-did=did-1", url)
+        self.assertIn("login_hint=user%40example.com", url)
+
+    def test_passwordless_web_auth_does_not_call_authorize_continue(self):
+        signin_response = Mock(status_code=200, url="https://chatgpt.com/api/auth/signin/openai")
+        signin_response.json.return_value = {"url": "https://auth.openai.com/api/accounts/authorize?state=state-1"}
+        signin_response.headers = {}
+        authorize_response = Mock(status_code=302, url="https://auth.openai.com/email-verification")
+        authorize_response.headers = {"location": "/email-verification"}
+        session = Mock()
+        session.post.return_value = signin_response
+        session.get.return_value = authorize_response
+
+        state = auth_flow._prepare_signup_auth_state(
+            session, "user@example.com", "did-1", "logging-1",
+            "https://auth.openai.com", "https://chatgpt.com", {}, "csrf",
+            passwordless_web=True,
+            attempts=({"name": "login_or_signup", "screen_hint": "login_or_signup", "prompt": ""},),
+        )
+
+        self.assertTrue(state["ok"])
+        session.post.assert_called_once()
+
+    def test_passwordless_login_page_uses_guarded_password_fallback(self):
+        signin_response = Mock(status_code=200, url="https://chatgpt.com/api/auth/signin/openai")
+        signin_response.json.return_value = {"url": "https://auth.openai.com/api/accounts/authorize?state=state-1"}
+        signin_response.headers = {}
+        authorize_response = Mock(status_code=200, url="https://auth.openai.com/log-in/password")
+        authorize_response.headers = {}
+        session = Mock()
+        session.post.return_value = signin_response
+        session.get.return_value = authorize_response
+        advanced = {"ok": True, "status": 200, "url": "https://auth.openai.com/create-account/password"}
+
+        with patch.object(auth_flow, "_continue_signup_username", return_value=advanced) as continue_signup:
+            state = auth_flow._prepare_signup_auth_state(
+                session, "user@example.com", "did-1", "logging-1",
+                "https://auth.openai.com", "https://chatgpt.com", {}, "csrf",
+                passwordless_web=True,
+                attempts=({"name": "login_or_signup", "screen_hint": "login_or_signup", "prompt": ""},),
+            )
+
+        self.assertTrue(state["ok"])
+        self.assertTrue(state["password_fallback"])
+        continue_signup.assert_called_once()
+
+    def test_cookie_presence_handles_curl_cookie_names(self):
+        session = Mock()
+        session.cookies = ["oai-did", "__Secure-next-auth.state"]
+        presence = auth_flow._cookie_presence(session)
+        self.assertTrue(presence["oai_did"])
+        self.assertTrue(presence["nextauth_state"])
 
     def test_registration_mode_defaults_to_passwordless_and_keeps_legacy_escape(self):
         self.assertEqual(_normalize_registration_mode(None), "passwordless")

@@ -51,12 +51,19 @@ sms_tool/
   commands/                 CLI subcommand helpers.
     helpers.py              Shared command-level utilities.
     payment.py              Protocol-payment argument adaptation and exit-code boundary.
+    payment_links.py        Link generation, UPI, and explicit payment-execution commands.
+    registration.py         Registration preflight, batch launch, and result adaptation.
+    accounts.py             Account maintenance/import/export command adaptation.
+    mailbox_ops.py          Inbox view and Gmail send command adaptation.
+    one_click.py            One-click SMS and account-scan command adaptation.
+    omakse.py               Omakase command adaptation.
   http_client.py            curl_cffi retry/transport handling.
   registration.py           Public registration facade and compatibility exports only.
   registration_state.py     Immutable input context, ordered state machine, and common stage deadline.
   registration_handlers.py Typed runtime state plus independent registration stage handlers and cleanup.
   registration_progress.py  Registration stage progress tracking and persistence.
   registration_concurrency.py Registration stage resource gates and wait metrics.
+  cross_process_gate.py     OS file-lock slots shared by concurrent desktop/CLI processes.
   auth_flow.py              OpenAI signin/authorize/continue helpers.
   auth_headers.py           Auth header construction and normalization.
   account_creation.py       Account creation and auth-session fetch.
@@ -81,11 +88,14 @@ sms_tool/
   payment_routing.py        Named proxy pools, stage routes, one-time selection, and redacted plans.
   payment_executor.py       Common payment execution state machine and terminal-result normalization.
   payment_link_manager.py   Payment state machine, adapter composition, and redacted run history.
+  payment_egress.py         Pre-side-effect proxy-country assertions with bounded caching.
   wallet_provider.py        Shared GoPay/GrabPay orchestration and structured outcomes.
   wallet_transport.py       GoPay/GrabPay HTTP transport, stage proxies, Stripe metadata, and redirect validation.
   gcash_provider.py         GCash custom-payment-method orchestration and structured outcomes.
   gcash_transport.py        GCash-specific Checkout update and custom-method HTTP transport.
   paypal_reconciliation.py  Independent, secret-free PayPal merchant-return reconciliation.
+  payment_reconciliation.py Method-neutral reconciliation facade and unknown-result contract.
+  paypal_authorization_queue.py Durable PayPal-only BA follow-up authorization queue.
   paypal_auto.py            Project-local PayPal browser page automation helper.
   nodriver_captcha.py       Nodriver-based CAPTCHA solver adapter.
   nodriver_paypal.py        Nodriver-based PayPal browser automation helper.
@@ -112,6 +122,9 @@ sms_tool/
   import_targets.py         Import target normalization helpers.
   account_scan.py           Account health/quoter scan adapter.
   storage.py                SQLite and session index persistence.
+  desktop_read.py           Sanitized read-contract handlers and session metadata caches.
+  desktop_serve.py          Resident JSONL desktop read server.
+  doctor.py                 Offline runtime, dependency, and configuration diagnostics.
   utils.py                  Shared utility helpers.
 
 SmsWorkbench/               WPF desktop UI.
@@ -145,9 +158,12 @@ runtime/                    SQLite, debug output, caches, ignored by Git.
 | Payment flow vocabulary | `sms_tool.payment_flow` | canonical stages and per-method profiles | proxy selection, provider HTTP |
 | Payment route planning | `sms_tool.payment_routing` | method config, named pools, stage policy | registration/mailbox proxies, provider execution |
 | Payment execution state | `sms_tool.payment_executor` | immutable request, adapter result, terminal state | CLI parsing, persistence, provider protocol details |
+| Protocol extractor terminal reporting | `services/protocol-payment/common/protocol_core.py` | method result payload, shared sensitive-data policy | route planning, account persistence, provider orchestration |
 | Checkout capability probing | `sms_tool.checkout_contract`, `sms_tool.payment_capability` | ChatGPT Checkout, Stripe init, matrix-selected country/proxy context | payment-method creation, confirm, approve, provider redirect |
 | Batch payment execution | `sms_tool.payment_batch` | JIT auth, capability probe/payment manager, eligibility matrix, proxy stages, atomic reports | Registration/mailbox procurement, token-bearing public reports |
 | PayPal return reconciliation | `sms_tool.paypal_reconciliation` | caller-supplied authenticated transport, allowlisted merchant return hosts | payment-link extraction, link persistence, payment authorization |
+| Payment reconciliation dispatch | `sms_tool.payment_reconciliation` | catalog reconciliation policy and method-owned reconciler | link generation, automatic retry of unknown side effects |
+| PayPal BA authorization queue | `sms_tool.paypal_authorization_queue` | completed PayPal BA extraction artifacts and explicit authorization handlers | non-PayPal methods, inline authorization during extraction |
 | Payment execution | `sms_tool.paypal_auto` | account seed, saved payment links, provider services | Registration, mailbox pool edits, link regeneration as a side effect |
 | Explicit Agent Identity conversion | `sms_tool.agent_identity` | account seed, Ed25519 key gen, storage | Registration flow, payment execution |
 | SUB2API import | `sms_tool.sub2api_import` | agent identity, session converter, SUB2API API | Registration, payment, mailbox polling |
@@ -309,9 +325,17 @@ sticky-session rotation (`rebuild_proxy_credentials`, `retarget_region`,
 `refresh_proxy_sid` / `match_proxy_region` / `rotate_proxy_session` /
 `retarget_proxy_country` / `infer_proxy_country` are thin wrappers that
 normalize and delegate to `proxy_entry`, so the same provider proxy rotates
-identically regardless of the calling flow (Cliproxy `region-XX`/`-sid-…-t-N`
-username templates and Kookeey `BASE-CC-SESSION-TTL` password templates, with
-the `\d+[smhd]` TTL unit superset).
+identically regardless of the calling flow (the parser understands both
+`region-XX`/`-sid-…-t-N` username templates and Kookeey
+`BASE-CC-SESSION-TTL` password templates, with the `\d+[smhd]` TTL unit
+superset). The proxy pool itself is Kookeey-only: `config.json` carries
+Kookeey gate URLs exclusively, the Cliproxy white/api short-lived fetch path
+and `stage_proxy_api_urls` are removed, and `direct_card` rotates Kookeey
+sticky passwords through the same template rules as `proxy_entry`. Before any
+subprocess extractor spawns, `payment_egress.assert_egress_countries` probes
+the routed checkout/approve/promotion proxies and rejects a run whose observed
+exit country mismatches the route plan (`protocol_payments.egress_check`,
+cached per proxy+country) — mis-routing fails before any side effect.
 
 #### Payment proxy config-per-method, health cache, and test-proxy
 
@@ -328,6 +352,13 @@ The **批量协议支付** window owns payment proxy configuration entirely per 
   stage, `ip / country / region`, whether the exit country is PayPal-supported,
   and any `country_mismatch`. This is the pre-flight check that stops a whole
   batch from launching on a dead or wrong-country pool.
+
+The dialog exposes the same complete billing-region catalog for Checkout,
+Approve, and Update rather than a JP/TR-only subset. Values selected in the
+current dialog are request-time inputs and therefore override saved
+`stage_proxy_countries` / `stage_routes` country defaults for the run and its
+proxy test. Saving persists those same effective values, so a later probe does
+not silently fall back to a stale country.
 
 Pool selection shares one process-level health/geo cache
 (`paypal_proxy.PayPalProxyState`, keyed by the stable `proxy_key`) so a batch of
@@ -355,9 +386,34 @@ country rules.
 - `paypal_direct`（PP直链）: `checkout -> stripe init -> pm create(type=paypal) -> confirm`, then follow Stripe `pm-redirects` to a PayPal `agreements/approve?ba_token=...` URL. The BA token is treated as sensitive and must not be logged in full.
 - `paypal_direct_zero_due`（PP直链-强制0元试用）: same direct PayPal approval flow, but `require_zero_due=true`; if Stripe init shows any non-zero amount, the flow stops with `checkout_not_zero_due` and does not persist a BA approval link. This strict mode also disables hosted-link fallback and old saved-link reuse so UI state cannot show a stale `link_ready` URL after the current zero-due direct generation fails.
 
+Checkout session families are deliberately split. An `oaics_*` identifier is a
+native ChatGPT Checkout session and immediately returns its
+`chatgpt.com/checkout/...` link; it must never be sent to Stripe's
+`/payment_pages/{id}/init`. A `cs_*` identifier remains on the Stripe/PayPal
+protocol path and is initialized before hosted-link or direct-approval handling.
+
+#### PayPal standard approval and promotion order
+
+The direct PayPal workflow uses one isolated Checkout transaction in this
+order: Checkout creation, Stripe init, PayPal PM creation, confirm, one ChatGPT
+approval submission, promotion/update on that same approved Checkout, then
+polling and redirect extraction. The implementation never sends a second
+approval request for the same Checkout. An HTTP 409 payload whose approval
+result is `blocked` is recorded as structured `last_retry_error` evidence and
+invalidates the Checkout; the bounded workflow retry starts again from a new
+Checkout. An ambiguous approve or post-approve poll failure becomes `unknown`
+with `requires_reconciliation`, because replaying the side effect could create
+a duplicate authorization.
+
+PayPal capability and zero-due eligibility are probed before full extraction.
+`checkout_not_zero_due` is an offer/eligibility conclusion, not a generic
+adapter transport failure. HTTP diagnostics retain status, a redacted endpoint,
+provider error code, and a bounded sanitized response summary.
+
 #### Promotion-update stage（0元 + PayPal 共存）
 
-Optional segmented stage between checkout creation and Stripe init. When
+The standard direct flow applies this optional segmented stage after confirm
+and successful approval, but before final polling. When
 `paypal.stage_proxies.promotion` is set, the extractor calls
 `POST /backend-api/payments/checkout/update` through a promo-eligible region
 egress to attach the `plus-1-month-free` promo to the **same** checkout that was
@@ -393,16 +449,30 @@ translated into CLI flags and the protocol remains in `sms_tool.registration`.
 The C#/Python process boundary is `IBackendClient`. `PythonBackendClient` uses `ProcessStartInfo.ArgumentList`, supports per-command environment values for secrets, pumps stdout/stderr, observes cancellation and timeout, and terminates the whole child process tree. Structured desktop results use one versioned line:
 
 ```text
-@@SMSWORKBENCH_IPC_V1@@{"version":1,"type":"result","payload":{...}}
+@@SMSWORKBENCH_V2@@{"schema":"smsworkbench.ipc.v2","version":2,"type":"event|result","run_id":"...","sequence":1,"timestamp_ms":0,"terminal":false,"payload":{...}}
 ```
 
-New desktop commands should emit this envelope through `sms_tool.desktop_ipc.emit_result`. `BackendJsonProtocol` keeps legacy trailing-JSON parsing only while old commands are migrated.
+`sms_tool.desktop_ipc` is the sole writer for the v2 envelope. Events and results share one prefix, schema, run id, sequence, timestamp, terminal flag, and sanitized payload. WPF accepts v1 envelopes only as a bounded read-only migration path; no v1 writer remains.
+
+Read-heavy account/mailbox refreshes use `DesktopReadClient` as a separate
+transport seam. It prefers the resident `python -m sms_tool --desktop-serve`
+JSONL channel, correlates concurrent requests by request ID, and restarts the
+process after an exit. A one-shot `--desktop-read` adapter remains the bounded
+fallback. Both transports return the same already-sanitized payload contract;
+WPF handlers must not know which transport served a request. Account and
+mailbox pools are fetched together, and session parsing/sanitization caches are
+keyed by file metadata rather than repeated for every row.
 
 MVVM migration is incremental rather than a rewrite:
 
 - `PaymentBatchWindow` + `PaymentBatchViewModel` + `PaymentBatchService` are the first complete vertical slice. The view binds commands and state; the service owns matrix serialization and backend invocation.
+- `StageMatrixViewModel` is limited to the embedded protocol-payment view. `JsonlStageMatrixStore` persists sanitized payment events under `runtime/stage_matrix.jsonl`, reloads recent runs at startup, bounds retention, and deduplicates by run sequence. Protocol registration does not open or reload a matrix popup; its current v2 progress is rendered on the owning task row so historical runs cannot inflate the active batch counters.
 - `SettingsWindow` + `SettingsViewModel` + `SettingsService` replace the dynamic code-built settings form. The catalog is data-driven, unknown JSON fields survive round trips, validation happens before persistence, and the replacement file is written in the configuration directory.
 - Existing `MainWindow.*.cs` handlers remain operational and move behind injected services one workflow at a time.
+- Registration progress lines containing `Saved session:` trigger a debounced
+  asynchronous pool refresh, so successfully persisted accounts appear before
+  a long batch ends. Selected-account deletion is one bounded backend batch
+  command with worker concurrency, not one Python process per row.
 
 WPF-UI is the sole desktop component library. HandyControl and MaterialDesign resources are not part of the application dependency graph.
 
@@ -457,6 +527,8 @@ dotnet build SmsWorkbench\SmsWorkbench.csproj
 It must not silently replace an explicit empty mailbox file with a new provider purchase. If the user passed a mailbox file and no mailbox was parsed, it exits with code `2`.
 
 Optional command modules are lazy seams. Codex export, CPA import, PayPal payment, PayPal/UPI link regeneration, and session refresh modules are imported only inside the command handler that needs them. Importing `sms_tool.cli` or `sms_tool.__main__` must not start a command or import optional payment/browser dependencies as a side effect.
+
+Command implementations live in focused `sms_tool/commands/*` modules (`payment`, `payment_links`, `registration`, `accounts`, `mailbox_ops`, `one_click`, `omakse`); each receives the legacy CLI's replaceable hooks through an explicit frozen context dataclass (e.g. `PaymentCommandContext`, `RegistrationCommandContext`). `cli.py` retains same-name thin wrappers only, so tests keep patching `sms_tool.cli` symbols and the WPF `BackendCommandPlanner` flag contract is unchanged.
 
 ### Mailbox Layer
 
@@ -516,7 +588,7 @@ normalized into the canonical message shape before OTP filtering.
 - `otp_strategy.py`: 注册用 OTP 发送 / 重发 endpoint 选择。
 - `sentinel_tokens.py` / `sentinel_quickjs.py`: Sentinel 提取 / QuickJS SDK 路径 / PoW+浏览器回退 / 缓存。
 - `auth_state.py`: `client_auth_session_dump` 抓取与脱敏诊断摘要。
-- `batch_runner.py`: 并发注册 worker 调度 / 结果排序 / mailbox 数量上限 / 网络+auth-state 失败有界重试并换新鲜代理 session。
+- `batch_runner.py`: 并发注册 worker 调度 / 结果排序 / mailbox 数量上限 / 网络+auth-state 失败有界重试并换新鲜代理 session。HTTP 429 单独归类为 `rate_limit`，不得立即重试；首个 429 会打开进程内认证流冷却电路，阻止同批次等待中的账号继续冲击上游。
 - `registration_outcome.py`: 注册结果归一化 — 账号创建错误提炼 / 多轮 AT 稳定性探测 / `codex_oauth.require_registration_refresh_token`、`require_registration_phone_verification` 开关。
 - `session_builder.py`: 从注册最终态拼装 canonical session JSON（含 `mailbox` 嵌套、token 优先级链、profile/device/paypal 字段、`created_at`）。
 
@@ -526,6 +598,9 @@ normalized into the canonical message shape before OTP filtering.
 批量注册每条加载的 mailbox 最多使用一次：`--count` 超过已加载的唯一 mailbox 数时会被截断，不会用取模方式回绕重复复用。
 每个账号拥有独立的 Sentinel 事务与 `oai-did`，batch worker 不把 token 返回共享池；账号创建过程产生的新鲜 refresh token 不写入共享缓存，OAuth create 创建的 refresh token 保留账号既有的 device ID。
 Fresh 提取受可配置的有界信号量保护（`sentinel_max_concurrency` 默认 2，上限 4）；缓存路径调用方保留 single-flight 填充语义。
+认证流使用独立 `registration.stage_concurrency.auth` gate，默认并发为 1；OTP、create-account 和 session 拉取继续使用 `network` gate。这样批量 worker 可以并行准备 Sentinel/邮箱，但不会并发轰击 `/api/accounts/authorize/continue`。
+
+`auth.openai.com/login` 与 `/log-in` 只表示当前 auth-state 的中间页面，不足以证明邮箱已经注册。`auth_flow.py` 必须继续提交 username，并以是否推进到邮箱验证或后续状态作为判定依据；只有 continue 后仍无法推进时，才记录一次有界的 `login_redirect_not_advanced` 失败并尝试下一条 auth 路径。注册进度的每次 attempt 只允许一个 terminal event，持久化层不得重复追加 `failed` / `completed`。
 
 If OTP validation succeeds but create-account returns
 `registration_disallowed`, the failure is treated as a provider/server-side
@@ -596,6 +671,15 @@ A probe-only Canary pauses the method profile when all evaluated results are
 systemically unknown. Conclusive `payment_method_unavailable` and
 `nonzero_offer` results remain account/offer conclusions and do not pause the
 profile.
+
+Batch reports keep capability probes separate from formal extraction results.
+Each desktop click creates a fresh generated batch ID by default. Checkpoint
+loading and event replay occur only when the caller explicitly sets
+`resume_checkpoint`; the UI displays `新执行` or `断点恢复` and the number of
+restored accounts. Account events are appended to a JSONL stream with stable
+domain, operation, run, batch, account, stage, and status fields, so a desktop
+restart can reconstruct progress. Terminal rows also persist per-stage timing,
+total duration, and the last failed stage.
 
 ### Shared Wallet Provider Layer
 
@@ -796,6 +880,18 @@ page may be retryable inside this independent API; that does not weaken the
 payment-link manager rule that an unknown side-effecting extraction outcome must
 be reconciled before retry.
 
+`sms_tool.payment_reconciliation.reconcile_payment_result` is the method-neutral
+dispatch boundary. Catalog policy selects a method-owned reconciler; unsupported
+or inconclusive outcomes remain `unknown` and require reconciliation rather
+than being retried as ordinary adapter failures.
+
+`sms_tool.paypal_authorization_queue` durably stores PayPal BA follow-up work
+after a BA approval artifact is extracted. Extraction never performs the final
+customer authorization inline. The queue is PayPal-only, deduplicates by the
+sensitive BA token internally, and exposes only presence booleans in public
+results. Other payment methods must not enqueue items or surface this queue in
+their desktop views.
+
 ### Local Provider Services
 
 `services/mail-otp-web` is a standalone operator diagnostic surface for Microsoft Graph inbox/OTP extraction. It accepts the same mailbox account-line formats as `sms_tool.mailbox`, refreshes Microsoft access tokens, displays recent messages, and may return a rotated mailbox refresh token to the operator. It is not the main registration mailbox owner: registration still uses `sms_tool.mailbox`, and this helper service must not edit `hotmail.txt`, session JSON, or SQLite rows directly.
@@ -837,6 +933,16 @@ agent identity keys, then uploads to the configured SUB2API endpoint.
 - LuckMail support is retired; ReMail is the maintained API mailbox source.
 - Runtime debug artifacts and `__pycache__` folders are not source surfaces and should be deleted or ignored.
 - Backup binaries such as `*.exe~` and unused duplicate artwork are not source surfaces.
+- `.zcode/`, the obsolete root `gates/`, pytest/Python caches, historical
+  protocol logs, and `bin/obj` output are generated state, not source. Active
+  cross-process lock slots belong only under ignored `runtime/gates/`; canonical
+  desktop and release artifacts are rebuilt under `dist/` for each release.
+
+The iDEAL, BLIK, and TWINT subprocesses share
+`common.protocol_core.ProtocolResultReporter` for exactly-once
+`protocol_payment.v1` terminal output, policy-based redaction, `already_paid`,
+missing-output fallback, and BLIK execute-payment framing. Extractors own only
+method-specific orchestration and feed their terminal payload into this seam.
 
 ### Test Layer
 

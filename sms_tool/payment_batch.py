@@ -11,11 +11,12 @@ import uuid
 from collections.abc import Mapping
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 from .account_seed import load_account_seed
 from .config import CFG
-from .sanitizer import sanitize as _canonical_sanitize
+from .cross_process_gate import CrossProcessSemaphore, GateTimeoutError
+from .sanitizer import sanitize as _canonical_sanitize, sanitize_text as _canonical_sanitize_text
 from .paths import runtime_file
 from .payment_auth import ensure_payment_access_token, public_payment_auth_result
 from .payment_link_manager import (
@@ -26,7 +27,12 @@ from .payment_link_manager import (
     probe_payment_method,
 )
 from .payment_routing import PaymentRoutePlanner
-from .payment_contracts import payment_history_metadata, payment_retry_allowed
+from .payment_contracts import PaymentResult, payment_history_metadata, payment_retry_allowed
+from .payment_catalog import PAYMENT_METHODS
+
+# Minimum spacing between "running" checkpoint rewrites of the batch report
+# (terminal states always persist immediately).
+_CHECKPOINT_MIN_INTERVAL_SECONDS = 2.0
 
 
 def load_payment_matrix(value: Any = None) -> list[dict[str, Any]]:
@@ -83,12 +89,25 @@ def run_payment_batch(
     probe_only: bool = False,
     matrix: Any = None,
     canary: int = 0,
-    retries: int = 1,
+    retries: int = 3,
     timeout: int = 30,
+    progress: Callable[[dict[str, Any]], None] | None = None,
+    access_tokens: dict[str, str] | None = None,
+    resume_checkpoint: bool | None = None,
 ) -> dict[str, Any]:
     method = normalize_payment_method(payment_method)
+    # The desktop and CLI pass an explicit boolean.  Keep direct Python callers
+    # that predate the flag source-compatible by treating an omitted value with
+    # a caller-supplied batch ID as an explicit resume request.
+    if resume_checkpoint is None:
+        resume_checkpoint = bool(str(batch_id or "").strip())
     if not method:
         raise ValueError(f"unsupported payment method: {payment_method}")
+    definition = PAYMENT_METHODS[method]
+    if not probe_only and not definition.batch_enabled:
+        raise ValueError(f"payment method is not enabled for batch execution: {method}")
+    if definition.release_tier == "canary" and not probe_only and not canary:
+        raise ValueError(f"payment method requires an explicit canary batch: {method}")
     selected = _unique_emails(emails)
     if canary:
         selected = selected[: max(1, int(canary))]
@@ -105,7 +124,7 @@ def run_payment_batch(
     default_cap = 2 if method in {"momo", "kakao"} else 4
     cap = max(1, int(method_caps.get(method) or default_cap))
     max_workers = max(1, min(int(workers or 1), cap, len(selected) or 1))
-    retry_count = max(0, min(int(retries or 0), 2))
+    retry_count = max(0, min(int(retries or 0), 5))
     base_kwargs = dict(payment_kwargs or {})
     method_configs = protocol_cfg.get("methods") if isinstance(protocol_cfg.get("methods"), Mapping) else {}
     canonical_method_cfg = method_configs.get(method) if isinstance(method_configs.get(method), Mapping) else {}
@@ -139,25 +158,83 @@ def run_payment_batch(
         proxy=proxy,
         retries=retry_count,
     )
-    report_path = _report_path(batch_id)
+    report_path = _report_path(batch_id, probe_only=probe_only)
     report_path.parent.mkdir(parents=True, exist_ok=True)
-    existing = _load_checkpoint(report_path, method, run_signature)
-    existing_by_ref = {
-        str(row.get("account_ref") or ""): row
-        for row in (existing.get("results") or [])
-        if (
-            isinstance(row, dict)
-            and row.get("account_ref")
-            and _checkpoint_row_resumable(row)
-        )
-    }
-    ordered: list[dict[str, Any] | None] = [
-        existing_by_ref.get(_account_ref(email)) for email in selected
-    ]
-    pending = [(index, email) for index, email in enumerate(selected) if ordered[index] is None]
+    event_path = _event_path(batch_id, probe_only=probe_only)
     checkpoint_lock = threading.Lock()
+    event_lock = threading.Lock()
+    process_gate = CrossProcessSemaphore(
+        f"payment-batch-{batch_id}",
+        1,
+        base_dir=runtime_file(CFG, "payment_batch_locks"),
+    )
+    try:
+        process_gate.acquire(timeout=30)
+    except GateTimeoutError as exc:
+        raise RuntimeError("payment batch is already running") from exc
+    try:
+        existing = _load_checkpoint(report_path, method, run_signature) if resume_checkpoint else {}
+    except Exception:
+        process_gate.release()
+        raise
+    try:
+        existing_by_ref = {
+            str(row.get("account_ref") or ""): row
+            for row in (existing.get("results") or [])
+            if (
+                isinstance(row, dict)
+                and row.get("account_ref")
+                and _checkpoint_row_resumable(row)
+            )
+        }
+        ordered: list[dict[str, Any] | None] = [
+            existing_by_ref.get(_account_ref(email)) for email in selected
+        ]
+        pending = [(index, email) for index, email in enumerate(selected) if ordered[index] is None]
+        if existing and resume_checkpoint:
+            _replay_events(event_path, run_signature, progress)
+        else:
+            _reset_event_log(event_path)
+    except Exception:
+        process_gate.release()
+        raise
+    stage_state: dict[str, dict[str, Any]] = {}
+
+    def emit(account_ref: str, stage: str, status: str = "running", **extra: Any) -> None:
+        if progress is None:
+            event = None
+        now_mono = time.monotonic()
+        state = stage_state.setdefault(account_ref, {"started": now_mono, "stage": "", "stage_started": now_mono, "timings": {}, "last_failed_stage": ""})
+        if state["stage"] and state["stage"] != stage:
+            state["timings"][state["stage"]] = state["timings"].get(state["stage"], 0) + int((now_mono - state["stage_started"]) * 1000)
+        if state["stage"] != stage:
+            state["stage"] = stage
+            state["stage_started"] = now_mono
+        if status in {"failed", "error"}:
+            state["last_failed_stage"] = stage
+        if extra.get("account_terminal"):
+            state["timings"][stage] = state["timings"].get(stage, 0) + int((now_mono - state["stage_started"]) * 1000)
+            extra.setdefault("duration_ms", int((now_mono - state["started"]) * 1000))
+            extra.setdefault("last_failed_stage", state["last_failed_stage"])
+            extra.setdefault("stage_timings_ms", dict(state["timings"]))
+        event = {
+            "domain": "payment",
+            "run_id": f"{batch_id}:{account_ref}",
+            "operation": "probe" if probe_only else "extract",
+            "batch_id": batch_id,
+            "method": method,
+            "account_ref": account_ref,
+            "stage": stage,
+            "status": status,
+            **extra,
+        }
+        _append_event(event_path, event, run_signature, event_lock)
+        if progress is not None:
+            progress(event)
 
     def run_one(index: int, email: str) -> tuple[int, dict[str, Any]]:
+        account_ref = _account_ref(email)
+        emit(account_ref, "routing")
         seed_context, _ = load_account_seed(email=email)
         seed_country = _registration_country(seed_context)
         cell = _matrix_cell_for(index, cells, method, seed_country)
@@ -176,13 +253,32 @@ def run_payment_batch(
         if checkout_route:
             kwargs["checkout_proxy"] = checkout_route
 
-        auth = ensure_payment_access_token(
-            email=email,
-            proxy=checkout_route,
-            timeout=timeout,
-            relogin_on_401=jit_refresh,
-            stabilization_probes=1,
-        )
+        emit(account_ref, "auth_gate")
+        manual_token = ""
+        for token_email, token_value in (access_tokens or {}).items():
+            if str(token_email).strip().lower() == email.strip().lower():
+                manual_token = str(token_value or "").strip()
+                break
+        if manual_token:
+            from .account_liveness import probe_account_liveness
+            probe = probe_account_liveness({"email": email, "access_token": manual_token}, proxy=checkout_route, timeout=timeout)
+            auth = {
+                "ok": int(probe.get("status_code") or 0) == 200,
+                "access_token": manual_token,
+                "auth_context": {"email": email, "access_token": manual_token},
+                "probed": True,
+                "refreshed": False,
+                "probe": probe,
+                "error": "" if int(probe.get("status_code") or 0) == 200 else str(probe.get("error") or "token_invalid"),
+            }
+        else:
+            auth = ensure_payment_access_token(
+                email=email,
+                proxy=checkout_route,
+                timeout=timeout,
+                relogin_on_401=jit_refresh,
+                stabilization_probes=1,
+            )
         auth_country = _registration_country(auth.get("auth_context"))
         registration_country = auth_country or seed_country
         expected_cell = _matrix_cell_for(index, cells, method, registration_country)
@@ -223,18 +319,27 @@ def run_payment_batch(
                     if seed_data is not None and is_permanently_deactivated(seed_data):
                         _persist_permanent_deactivation(seed_data)
                         row["terminal_persisted"] = True
-                except Exception as exc:
+                except (OSError, ValueError, TypeError, RuntimeError) as exc:
                     # 落库失败不影响批次主流程，只标记一下，避免拖垮整批。
                     row["terminal_persisted"] = False
-                    row["terminal_persist_error"] = str(exc)
+                    row["terminal_persist_error"] = _canonical_sanitize_text(str(exc))
+            row["status"] = "failed"
+            emit(account_ref, "auth_gate", "failed", detail=row["decision"], account_terminal=True)
+            timing = stage_state.get(account_ref, {})
+            row.update({"stage_timings_ms": dict(timing.get("timings") or {}), "total_duration_ms": int((time.monotonic() - timing.get("started", time.monotonic())) * 1000), "last_failed_stage": timing.get("last_failed_stage") or "auth_gate"})
             return index, row
+        emit(account_ref, "auth_gate", "completed")
         if cell.get("matrix_mismatch") or matrix_route_mismatch:
             row["eligible"] = False
             row["decision"] = "matrix_registration_country_mismatch"
             row["error"] = row["decision"]
             row["retryable"] = False
+            emit(account_ref, "validation", "failed", detail=row["decision"], account_terminal=True)
+            timing = stage_state.get(account_ref, {})
+            row.update({"stage_timings_ms": dict(timing.get("timings") or {}), "total_duration_ms": int((time.monotonic() - timing.get("started", time.monotonic())) * 1000), "last_failed_stage": timing.get("last_failed_stage") or "validation"})
             return index, row
         if probe_only:
+            emit(account_ref, "capability_probe")
             capability: dict[str, Any] = {}
             for probe_attempt in range(1, retry_count + 2):
                 capability = probe_payment_method(
@@ -258,33 +363,160 @@ def run_payment_batch(
                 "decision": decision,
                 "attempts": probe_attempt,
             })
+            emit(
+                account_ref,
+                "capability_probe",
+                "completed" if row.get("ok") else "failed",
+                account_terminal=True,
+            )
+            timing = stage_state.get(account_ref, {})
+            row.update({"stage_timings_ms": dict(timing.get("timings") or {}), "total_duration_ms": int((time.monotonic() - timing.get("started", time.monotonic())) * 1000), "last_failed_stage": timing.get("last_failed_stage")})
             return index, row
+        if method == "paypal":
+            emit(account_ref, "capability_probe")
+            capability: dict[str, Any] = {}
+            for probe_attempt in range(1, retry_count + 2):
+                capability = probe_payment_method(
+                    access_token=str(auth.get("access_token") or ""),
+                    payment_method=method,
+                    auth_context=auth.get("auth_context") if isinstance(auth.get("auth_context"), dict) else None,
+                    proxy=checkout_route,
+                    timeout=max(5, int(timeout or 30)),
+                    **kwargs,
+                )
+                if capability.get("ok") or not _is_transient(capability) or probe_attempt > retry_count:
+                    break
+            public_capability = _public_payment_result(capability)
+            probed_eligible = public_capability.get("eligible")
+            if probed_eligible is not True:
+                decision = str(
+                    public_capability.get("decision")
+                    or public_capability.get("error_code")
+                    or ("trial_ineligible" if probed_eligible is False else "capability_unknown")
+                )
+                row.update(public_capability)
+                row.update({
+                    "auth": public_auth,
+                    "capability_probed": True,
+                    "attempted": False,
+                    "eligible": probed_eligible if isinstance(probed_eligible, bool) else None,
+                    "decision": decision,
+                    "attempts": probe_attempt,
+                    "error_stage": str(public_capability.get("error_stage") or "eligibility"),
+                })
+                if probed_eligible is False:
+                    row["classification"] = "ineligible"
+                    row["retryable"] = False
+                    row["error_stage"] = "eligibility"
+                emit(account_ref, "capability_probe", "failed", detail=decision, account_terminal=True)
+                timing = stage_state.get(account_ref, {})
+                row.update({"stage_timings_ms": dict(timing.get("timings") or {}), "total_duration_ms": int((time.monotonic() - timing.get("started", time.monotonic())) * 1000), "last_failed_stage": timing.get("last_failed_stage") or "capability_probe"})
+                return index, row
+            row["capability_probed"] = True
+            row["eligible"] = True
+            emit(account_ref, "capability_probe", "completed")
         last: dict[str, Any] = {}
         for attempt in range(1, retry_count + 2):
             row["attempted"] = True
+            emit(account_ref, "provider", attempt=attempt, max_attempts=retry_count + 1)
+
+            def adapter_progress(event: dict[str, Any] | None = None) -> None:
+                """Fold adapter-level stages into the batch event/timing stream.
+
+                Adapters emit the detailed checkout/provider/redirect stages via
+                the payment-link manager.  Sending those events directly to the
+                caller used to leave the batch timing state stuck on ``provider``
+                and made the desktop progress view lose the canonical fields.
+                Re-emit through ``emit`` so every stage updates the same per-
+                account timer and event schema.
+                """
+                payload = dict(event or {})
+                stage = str(payload.pop("stage", "") or "provider").strip().lower()
+                status = str(payload.pop("status", payload.pop("state", "running")) or "running")
+                for key in (
+                    "domain", "run_id", "batch_id", "account_ref", "operation", "method",
+                    "attempt", "max_attempts", "account_terminal", "batch_terminal",
+                    "duration_ms", "stage_timings_ms", "last_failed_stage",
+                ):
+                    payload.pop(key, None)
+                emit(
+                    account_ref,
+                    stage,
+                    status,
+                    attempt=attempt,
+                    max_attempts=retry_count + 1,
+                    **payload,
+                )
+
             last = generate_payment_link(
                 access_token=str(auth.get("access_token") or ""),
                 proxy=checkout_route,
                 payment_method=method,
+                operation_id=f"{batch_id}:{account_ref}",
+                idempotency_key=f"{batch_id}:{account_ref}",
                 auth_context=auth.get("auth_context") if isinstance(auth.get("auth_context"), dict) else None,
+                progress=adapter_progress,
                 **kwargs,
             )
             if last.get("ok") or not _is_transient(last) or attempt > retry_count:
                 break
+        authorization_queue: dict[str, Any] = {}
+        if method == "paypal" and last.get("ok") and last.get("url"):
+            try:
+                from .paypal_authorization_queue import enqueue_paypal_ba_authorization
+
+                authorization_queue = enqueue_paypal_ba_authorization(
+                    email=email,
+                    approval_url=str(last.get("url") or ""),
+                    batch_id=batch_id,
+                    account_ref=account_ref,
+                    source_report=str(report_path),
+                )
+            except ValueError:
+                # Hosted Checkout links can legitimately omit a BA token. Only
+                # direct BA approval artifacts enter the follow-up queue.
+                authorization_queue = {}
         public = _public_payment_result(last)
         decision = str(public.get("decision") or public.get("error_code") or ("ready" if public.get("ok") else "failed"))
         eligible = _eligible_from_result(method, public)
         row.update(public)
+        if str(row.get("status") or "").lower() == "unknown":
+            row["requires_reconciliation"] = True
         row.update({
             "auth": public_auth,
             "attempted": True,
             "eligible": eligible,
             "decision": decision,
             "attempts": attempt,
+            "authorization_queued": bool(authorization_queue),
+            "authorization_queue_id": str(authorization_queue.get("id") or ""),
+            "authorization_status": str(authorization_queue.get("status") or ""),
         })
+        emit(
+            account_ref,
+            "completed" if row.get("ok") else str(row.get("error_stage") or "failed"),
+            "completed" if row.get("ok") else "failed",
+            account_terminal=True,
+        )
+        timing = stage_state.get(account_ref, {})
+        row.update({"stage_timings_ms": dict(timing.get("timings") or {}), "total_duration_ms": int((time.monotonic() - timing.get("started", time.monotonic())) * 1000), "last_failed_stage": timing.get("last_failed_stage") or (str(row.get("error_stage") or "") if not row.get("ok") else "")})
         return index, row
 
-    def checkpoint(status: str) -> dict[str, Any]:
+    last_checkpoint_write = [0.0]
+
+    def checkpoint(status: str, *, force: bool = False) -> dict[str, Any]:
+        # Rebuilding + rewriting the full report on every future completion made
+        # batch IO O(n²); running checkpoints are throttled to one write per
+        # interval while terminal states always persist. A crash can lose at
+        # most one interval of progress, which resume re-runs by signature.
+        now = time.monotonic()
+        if (
+            status == "running"
+            and not force
+            and now - last_checkpoint_write[0] < _CHECKPOINT_MIN_INTERVAL_SECONDS
+        ):
+            return None
+        last_checkpoint_write[0] = now
         results = [_sanitize_report_value(row) for row in ordered if row is not None]
         report = _build_report(
             batch_id=batch_id,
@@ -299,46 +531,50 @@ def run_payment_batch(
             status=status,
             resumed=len(selected) - len(pending),
             run_signature=run_signature,
+            resume_checkpoint=resume_checkpoint,
         )
         with checkpoint_lock:
             _write_checkpoint(report_path, report)
         return report
 
-    if pending:
-        checkpoint("running")
-    with ThreadPoolExecutor(max_workers=max_workers) as executor:
-        futures = {executor.submit(run_one, index, email): (index, email) for index, email in pending}
-        for future in as_completed(futures):
-            fallback_index, fallback_email = futures[future]
-            try:
-                index, row = future.result()
-            except Exception as exc:
-                index = fallback_index
-                row = {
-                    "index": index,
-                    "account_ref": _account_ref(fallback_email),
-                    "matrix_cell": "unassigned",
-                    "authenticated": False,
-                    "eligible": None,
-                    "attempted": False,
-                    "ok": False,
-                    "decision": "payment_worker_exception",
-                    "error": f"{type(exc).__name__}: {exc}",
-                    "retryable": True,
-                }
-            ordered[index] = row
-            checkpoint("running")
-    report = checkpoint("finished")
-    if canary:
-        report["canary_state"] = _record_canary_state(method, report)
-        _write_checkpoint(report_path, report)
-    return report
+    try:
+        if pending:
+            checkpoint("running", force=True)
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            futures = {executor.submit(run_one, index, email): (index, email) for index, email in pending}
+            for future in as_completed(futures):
+                fallback_index, fallback_email = futures[future]
+                try:
+                    index, row = future.result()
+                except (OSError, ValueError, TypeError, RuntimeError) as exc:
+                    index = fallback_index
+                    row = {
+                        "index": index,
+                        "account_ref": _account_ref(fallback_email),
+                        "matrix_cell": "unassigned",
+                        "authenticated": False,
+                        "eligible": None,
+                        "attempted": False,
+                        "ok": False,
+                        "decision": "payment_worker_exception",
+                        "error": _canonical_sanitize_text(f"{type(exc).__name__}: {exc}"),
+                        "retryable": True,
+                    }
+                ordered[index] = row
+                checkpoint("running")
+        report = checkpoint("finished")
+        if canary:
+            report["canary_state"] = _record_canary_state(method, report)
+            _write_checkpoint(report_path, report)
+        return report
+    finally:
+        process_gate.release()
 
 
 def _build_report(*, batch_id: str, method: str, started: float, workers: int,
                   probe_only: bool, selected_count: int, results: list[dict[str, Any]],
                   cells: list[dict[str, Any]], report_path: Path, status: str,
-                  resumed: int, run_signature: str) -> dict[str, Any]:
+                  resumed: int, run_signature: str, resume_checkpoint: bool = False) -> dict[str, Any]:
     now = time.time()
     return {
         "ok": status == "finished" and bool(results) and all(bool(row.get("ok")) for row in results),
@@ -351,8 +587,11 @@ def _build_report(*, batch_id: str, method: str, started: float, workers: int,
         "elapsed_seconds": round(now - started, 3),
         "workers": workers,
         "probe_only": bool(probe_only),
+        "mode": "probe" if probe_only else "extract",
         "run_signature": run_signature,
         "resumed": resumed,
+        "resume_checkpoint": bool(resume_checkpoint),
+        "execution_mode": "断点恢复" if resume_checkpoint else "新执行",
         "counts": _batch_counts(results, selected_count),
         "matrix": _matrix_summary(results, cells),
         "results": results,
@@ -535,13 +774,24 @@ def _is_transient(result: dict[str, Any]) -> bool:
 
 def _public_payment_result(result: dict[str, Any]) -> dict[str, Any]:
     blocked = {"access_token", "auth_context", "raw_output", "raw_output_tail", "state_history"}
-    return {key: value for key, value in dict(result or {}).items() if key not in blocked and "token" not in key.lower()}
+    token_metadata = {
+        "token_telemetry", "token_hash", "token_changed",
+        "authorization_queued", "authorization_queue_id", "authorization_status",
+    }
+    return {
+        key: value
+        for key, value in dict(result or {}).items()
+        if key not in blocked and ("token" not in key.lower() or key.lower() in token_metadata)
+    }
 
 
 def _sanitize_report_value(value: Any, key: str = "") -> Any:
     lowered = key.lower()
     blocked = {"email", "access_token", "refresh_token", "id_token", "auth_context", "password"}
-    token_metadata = {"token_telemetry", "token_hash", "token_changed"}
+    token_metadata = {
+        "token_telemetry", "token_hash", "token_changed",
+        "authorization_queued", "authorization_queue_id", "authorization_status",
+    }
     if lowered in blocked or "proxy" in lowered or ("token" in lowered and lowered not in token_metadata):
         return None
     if isinstance(value, dict):
@@ -575,8 +825,47 @@ def _safe_batch_id(value: str) -> str:
     return re.sub(r"[^A-Za-z0-9_.-]+", "_", str(value or "").strip())[:80]
 
 
-def _report_path(batch_id: str) -> Path:
-    return runtime_file(CFG, "payment_batches") / f"{batch_id}.json"
+def _report_path(batch_id: str, *, probe_only: bool = False) -> Path:
+    suffix = ".probe" if probe_only else ".extract"
+    return runtime_file(CFG, "payment_batches") / f"{batch_id}{suffix}.json"
+
+
+def _event_path(batch_id: str, *, probe_only: bool = False) -> Path:
+    suffix = ".probe" if probe_only else ".extract"
+    return runtime_file(CFG, "payment_batches") / f"{batch_id}{suffix}.events.jsonl"
+
+
+def _append_event(path: Path, event: dict[str, Any], run_signature: str, lock: threading.Lock) -> None:
+    record = _canonical_sanitize({"run_signature": run_signature, "event": event})
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with lock:
+        with path.open("a", encoding="utf-8") as stream:
+            stream.write(json.dumps(record, ensure_ascii=False, separators=(",", ":")) + "\n")
+
+
+def _replay_events(path: Path, run_signature: str, progress: Callable[[dict[str, Any]], None] | None) -> None:
+    if progress is None or not path.is_file():
+        return
+    try:
+        lines = path.read_text(encoding="utf-8").splitlines()[-5000:]
+    except OSError:
+        return
+    for line in lines:
+        try:
+            record = json.loads(line)
+            if record.get("run_signature") != run_signature or not isinstance(record.get("event"), dict):
+                continue
+            progress({**record["event"], "replayed": True})
+        except (ValueError, TypeError, json.JSONDecodeError):
+            continue
+
+
+def _reset_event_log(path: Path) -> None:
+    try:
+        if path.is_file():
+            path.unlink()
+    except OSError:
+        pass
 
 
 def _load_checkpoint(path: Path, method: str, run_signature: str) -> dict[str, Any]:
@@ -597,6 +886,9 @@ def _load_checkpoint(path: Path, method: str, run_signature: str) -> dict[str, A
 
 def _checkpoint_row_resumable(row: dict[str, Any]) -> bool:
     """Resume only completed success or an explicitly non-retryable failure."""
+    contract = PaymentResult.from_mapping(row)
+    if contract.outcome.requires_reconciliation or contract.outcome.side_effect_started and not contract.ok:
+        return True
     if row.get("ok") is True:
         return True
     return row.get("ok") is False and row.get("retryable") is False
@@ -613,11 +905,13 @@ def _batch_run_signature(
     retries: int,
 ) -> str:
     payload = {
-        "version": 1,
+        "version": 2,
         "payment_method": method,
         "probe_only": bool(probe_only),
         "jit_refresh": bool(jit_refresh),
         "matrix": matrix,
+        # Values are hashed immediately and never persisted; retaining the raw
+        # material here ensures credential or route changes invalidate resume.
         "payment_kwargs": payment_kwargs,
         "proxy": proxy or "",
         "retries": int(retries),

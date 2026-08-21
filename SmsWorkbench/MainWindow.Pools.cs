@@ -15,7 +15,7 @@ namespace SmsWorkbench
             string term = (SearchText ?? "").Trim().ToLowerInvariant();
 
             if (scope == "邮箱池" && !IsMailboxPoolLikeRow(row)) return false;
-            if (scope == "已注册" && !row.AccountType.Contains("Session") && !row.AccountType.Contains("SQLite")) return false;
+            if (scope == "已注册" && !IsRegisteredRow(row)) return false;
             if (scope == "待处理" && !row.Status.Contains("待") && !row.Status.Contains("缺") && !row.Status.Contains("失败")) return false;
             if (term.Length == 0) return true;
 
@@ -29,17 +29,50 @@ namespace SmsWorkbench
             return MailboxPoolFileStore.IsMailboxPoolLike(row.AccountType, row.MailboxProvider);
         }
 
+        private bool poolsRefreshRunning;
+
+        /// <summary>
+        /// Fire-and-forget refresh entry kept for existing sync callers; the
+        /// actual work is async so the UI thread never waits on a backend call.
+        /// </summary>
         private void RefreshPools()
         {
-            allRows.Clear();
-            LoadMailboxPool();
-            LoadSessionPool();
-            DeduplicateRows();
-            currentPage = 1;
-            UpdateOverview();
-            RefreshPagedRows();
-            StatusText = $"共 {allRows.Count} 条；当前筛选 {filteredCount} 条";
-            Log("邮箱池和 session 状态已刷新。");
+            _ = RefreshPoolsAsync();
+        }
+
+        private async Task RefreshPoolsAsync()
+        {
+            if (poolsRefreshRunning)
+                return;
+            poolsRefreshRunning = true;
+            try
+            {
+                allRows.Clear();
+                try
+                {
+                    // One merged request (accounts + mailbox pool) through the
+                    // resident channel; falls back to the two separate reads.
+                    JsonElement merged = await desktopRead.ReadPoolsAsync(GetChataiMailboxFilePath());
+                    ApplyMailboxPoolPayload(merged);
+                    ApplyAccountsPayload(merged);
+                }
+                catch (Exception ex)
+                {
+                    Log("合并读取邮箱池/账号失败，改用分开读取：" + SensitiveDataSanitizer.Redact(ex.Message));
+                    await LoadMailboxPoolAsync();
+                    await LoadSessionPoolAsync();
+                }
+                DeduplicateRows();
+                currentPage = 1;
+                UpdateOverview();
+                RefreshPagedRows();
+                StatusText = $"共 {allRows.Count} 条；当前筛选 {filteredCount} 条";
+                Log("邮箱池和 session 状态已刷新。");
+            }
+            finally
+            {
+                poolsRefreshRunning = false;
+            }
         }
 
         private void RefreshPagedRows()
@@ -88,7 +121,7 @@ namespace SmsWorkbench
         private bool IsRegisteredRow(PoolRow row)
         {
             return row.AccountType.Contains("Session")
-                || row.AccountType.Contains("SQLite")
+                || row.SourcePath.EndsWith(".sqlite3", StringComparison.OrdinalIgnoreCase)
                 || row.Status.Contains("已注册")
                 || row.Status.Contains("PayPal");
         }
@@ -142,7 +175,7 @@ namespace SmsWorkbench
 
         private int RowPriority(PoolRow row)
         {
-            if (row.AccountType.Contains("SQLite")) return 30;
+            if (row.SourcePath.EndsWith(".sqlite3", StringComparison.OrdinalIgnoreCase)) return 30;
             if (row.AccountType.Contains("Session")) return 20;
             if (row.PayPalUrl.Length > 0 || row.Status.Contains("PayPal")) return 15;
             return 10;
@@ -153,25 +186,30 @@ namespace SmsWorkbench
             return MailboxPoolFileStore.NormalizeEmailKey(email);
         }
 
-        private void LoadMailboxPool()
+        private async Task LoadMailboxPoolAsync()
         {
             if (System.ComponentModel.DesignerProperties.GetIsInDesignMode(this)) return;
             try
             {
-                JsonElement payload = desktopRead.ReadMailboxPoolAsync(chataiMailboxFilePath).GetAwaiter().GetResult();
-                if (!payload.TryGetProperty("files", out JsonElement files) || files.ValueKind != JsonValueKind.Array)
-                {
-                    Log("读取邮箱池 backend 失败：响应缺少 files 数组。");
-                    return;
-                }
-                foreach (JsonElement file in files.EnumerateArray())
-                {
-                    AddMailboxPoolFileRows(file);
-                }
+                JsonElement payload = await desktopRead.ReadMailboxPoolAsync(GetChataiMailboxFilePath());
+                ApplyMailboxPoolPayload(payload);
             }
             catch (Exception ex)
             {
                 Log("读取邮箱池 backend 失败：" + SensitiveDataSanitizer.Redact(ex.Message));
+            }
+        }
+
+        private void ApplyMailboxPoolPayload(JsonElement payload)
+        {
+            if (!payload.TryGetProperty("files", out JsonElement files) || files.ValueKind != JsonValueKind.Array)
+            {
+                Log("读取邮箱池 backend 失败：响应缺少 files 数组。");
+                return;
+            }
+            foreach (JsonElement file in files.EnumerateArray())
+            {
+                AddMailboxPoolFileRows(file);
             }
         }
 
@@ -272,22 +310,13 @@ namespace SmsWorkbench
             return "";
         }
 
-        private void LoadSessionPool()
+        private async Task LoadSessionPoolAsync()
         {
             if (System.ComponentModel.DesignerProperties.GetIsInDesignMode(this)) return;
             try
             {
-                JsonElement payload = desktopRead.ReadAccountsAsync().GetAwaiter().GetResult();
-                if (!payload.TryGetProperty("accounts", out JsonElement accounts) || accounts.ValueKind != JsonValueKind.Array)
-                {
-                    Log("读取账号 backend 失败：响应缺少 accounts 数组。");
-                    return;
-                }
-                foreach (JsonElement account in accounts.EnumerateArray())
-                {
-                    Dictionary<string, object> data = JsonElementToDictionary(account);
-                    AddBackendAccountRow(data);
-                }
+                JsonElement payload = await desktopRead.ReadAccountsAsync();
+                ApplyAccountsPayload(payload);
             }
             catch (Exception ex)
             {
@@ -295,9 +324,29 @@ namespace SmsWorkbench
             }
         }
 
-        private void AddBackendAccountRow(Dictionary<string, object> data)
+        private void ApplyAccountsPayload(JsonElement payload)
         {
-            string rawJson = data.TryGetValue("session", out object session) ? JsonSerializer.Serialize(session) : "{}";
+            if (!payload.TryGetProperty("accounts", out JsonElement accounts) || accounts.ValueKind != JsonValueKind.Array)
+            {
+                Log("读取账号 backend 失败：响应缺少 accounts 数组。");
+                return;
+            }
+            // Per-refresh values hoisted out of the row loop; each used to
+            // re-read and re-parse config.json once (or twice) per account.
+            string databasePath = GetDatabasePath();
+            foreach (JsonElement account in accounts.EnumerateArray())
+            {
+                Dictionary<string, object> data = JsonElementToDictionary(account);
+                string rawJson = account.TryGetProperty("session", out JsonElement sessionElement)
+                    && sessionElement.ValueKind == JsonValueKind.Object
+                    ? sessionElement.GetRawText()
+                    : "{}";
+                AddBackendAccountRow(data, databasePath, rawJson);
+            }
+        }
+
+        private void AddBackendAccountRow(Dictionary<string, object> data, string databasePath, string rawJson)
+        {
             string status = GetString(data, "status");
             bool hasAccess = ParseBoolean(FirstNonEmpty(
                 GetString(data, "access_token_present"),
@@ -325,10 +374,13 @@ namespace SmsWorkbench
                 CreatedAt = UnixTimeText(GetString(data, "created_at")),
                 CompletedAt = UnixTimeText(GetString(data, "updated_at")),
                 Identifier = GetString(data, "email"),
-                AccountType = "SQLite" + (provider.Length > 0 ? "/" + provider : ""),
+                AccountType = MailboxTypeDisplay(provider, GetString(data, "email")),
                 AccountPlanType = AccountStatusInterpreter.GetAccountPlanType(data),
+                Source = GetString(data, "source"),
+                RegisterMethod = GetString(data, "register_method"),
+                SessionType = GetString(data, "session_type"),
+                PlanType = FirstNonEmpty(GetString(data, "plan_type"), GetString(data, "account_type")),
                 RegistrationCountry = GetString(data, "registration_country"),
-                QuotaStatus = AccountStatusInterpreter.GetQuotaStatus(data),
                 Status = AccountStatusInterpreter.DisplayAccountStatus(status, paypalOk, accessState, GetString(data, "error"), paypalStatus, refreshStatus, AccountStatusInterpreter.GetImportedStatus(rawJson)),
                 PayPalStatus = AccountStatusInterpreter.DisplayPayPalStatus(paypalStatus, paypalOk, paypalUrl, paymentMethod),
                 PayPalAmount = AccountStatusInterpreter.GetPaypalAmount(rawJson),
@@ -343,21 +395,32 @@ namespace SmsWorkbench
                 PayPalUrl = paypalUrl,
                 RefreshToken = provider == "remail" ? "ReMail" : hasAccess ? "AT" : "",
                 Proxy = DbTimingText(new Dictionary<string, string>(data.ToDictionary(pair => pair.Key, pair => Convert.ToString(pair.Value) ?? ""))),
-                Notes = GetString(data, "json_path").Length > 0 ? GetString(data, "json_path") : GetDatabasePath(),
-                SourcePath = GetDatabasePath(),
+                Notes = GetString(data, "json_path").Length > 0 ? GetString(data, "json_path") : databasePath,
+                SourcePath = databasePath,
                 RawLine = GetString(data, "id"),
                 MailboxProvider = provider
             };
-            WhamQuotaFields quotaFields = AccountStatusInterpreter.ExtractWhamQuotaFields(data);
-            row.Quota5hUsed = quotaFields.Quota5hUsed;
-            row.Quota5hLimit = quotaFields.Quota5hLimit;
-            row.Quota5hRemaining = quotaFields.Quota5hRemaining;
-            row.Quota5hPercent = quotaFields.Quota5hPercent;
-            row.Quota7dUsed = quotaFields.Quota7dUsed;
-            row.Quota7dLimit = quotaFields.Quota7dLimit;
-            row.Quota7dRemaining = quotaFields.Quota7dRemaining;
-            row.Quota7dPercent = quotaFields.Quota7dPercent;
             allRows.Add(row);
+        }
+
+        internal static string MailboxTypeDisplay(string provider, string email = "")
+        {
+            string normalized = (provider ?? "").Trim().ToLowerInvariant().Replace("-", "_");
+            string domain = (email ?? "").Split('@').LastOrDefault()?.ToLowerInvariant() ?? "";
+            return normalized switch
+            {
+                "remail" when domain is "outlook.com" or "hotmail.com" or "live.com" or "msn.com" => "remail/outlook",
+                "remail" => "remail",
+                "icloud_url" or "icloud" => "icloud",
+                "cf_worker" or "cfworker" => "cfworker",
+                "chongzhi" when domain is "outlook.com" or "hotmail.com" or "live.com" or "msn.com" => "outlook",
+                "microsoft" or "graph" or "outlook" => "outlook",
+                "gmail" => "gmail",
+                "smailr" => "smailr",
+                "chatai" => "chatai",
+                "" => "unknown",
+                _ => normalized,
+            };
         }
     }
 }

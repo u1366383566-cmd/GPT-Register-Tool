@@ -6,6 +6,8 @@ from dataclasses import dataclass
 from enum import Enum
 from typing import Any, Mapping
 
+from .payment_catalog import PAYMENT_METHODS as CATALOG_PAYMENT_METHODS
+
 
 class PaymentStage(str, Enum):
     AUTH_GATE = "auth_gate"
@@ -58,7 +60,7 @@ class PaymentFlowProfile:
         return normalize_payment_stage(stage) in self.stages
 
 
-FLOW_PROFILES: dict[str, PaymentFlowProfile] = {
+_LEGACY_FLOW_PROFILES: dict[str, PaymentFlowProfile] = {
     "paypal": PaymentFlowProfile(
         "paypal_agreement",
         (
@@ -98,6 +100,44 @@ FLOW_PROFILES: dict[str, PaymentFlowProfile] = {
             PaymentStage.CONFIRM.value,
             PaymentStage.APPROVE.value,
             PaymentStage.POLL.value,
+            PaymentStage.REDIRECT.value,
+            PaymentStage.ARTIFACT.value,
+        ),
+    ),
+    "qris": PaymentFlowProfile(
+        "regional_wallet_redirect",
+        (
+            PaymentStage.AUTH_GATE.value,
+            PaymentStage.CHECKOUT.value,
+            PaymentStage.PROMOTION.value,
+            PaymentStage.STRIPE_INIT.value,
+            PaymentStage.PAYMENT_METHOD.value,
+            PaymentStage.CONFIRM.value,
+            PaymentStage.REDIRECT.value,
+            PaymentStage.ARTIFACT.value,
+        ),
+        artifact_kind="url_or_qr",
+    ),
+    "bizum": PaymentFlowProfile(
+        "regional_hosted_redirect",
+        (
+            PaymentStage.AUTH_GATE.value,
+            PaymentStage.CHECKOUT.value,
+            PaymentStage.STRIPE_INIT.value,
+            PaymentStage.PAYMENT_METHOD.value,
+            PaymentStage.CONFIRM.value,
+            PaymentStage.REDIRECT.value,
+            PaymentStage.ARTIFACT.value,
+        ),
+    ),
+    "naver_pay": PaymentFlowProfile(
+        "regional_hosted_redirect",
+        (
+            PaymentStage.AUTH_GATE.value,
+            PaymentStage.CHECKOUT.value,
+            PaymentStage.STRIPE_INIT.value,
+            PaymentStage.PAYMENT_METHOD.value,
+            PaymentStage.CONFIRM.value,
             PaymentStage.REDIRECT.value,
             PaymentStage.ARTIFACT.value,
         ),
@@ -167,6 +207,16 @@ FLOW_PROFILES: dict[str, PaymentFlowProfile] = {
         ),
         artifact_kind="completion",
     ),
+}
+
+FLOW_PROFILES: dict[str, PaymentFlowProfile] = {
+    key: PaymentFlowProfile(
+        definition.flow_profile,
+        tuple(definition.stages),
+        artifact_kind=definition.artifact_kind,
+        side_effect_stage=definition.side_effect_stage,
+    )
+    for key, definition in CATALOG_PAYMENT_METHODS.items()
 }
 
 _GENERIC_REDIRECT = PaymentFlowProfile(

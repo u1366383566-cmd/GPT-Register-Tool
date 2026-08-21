@@ -55,6 +55,33 @@ namespace SmsWorkbench
             }
         }
 
+        private void CtxCopyAccessToken_Click(object sender, RoutedEventArgs e)
+            => RunUiTask(CtxCopyAccessTokenAsync);
+
+        private async Task CtxCopyAccessTokenAsync()
+        {
+            if (AccountGrid?.SelectedItem is not PoolRow row)
+            {
+                NotifyWarning("请先选择一个账号。");
+                return;
+            }
+            string accessToken = await ResolveAccountAccessTokenAsync(row);
+            if (string.IsNullOrWhiteSpace(accessToken))
+            {
+                NotifyWarning("当前选中账号没有可复制的 AT。");
+                return;
+            }
+            try
+            {
+                Clipboard.SetText(accessToken);
+                NotifyInfo("AT 已复制。");
+            }
+            catch (Exception ex)
+            {
+                Log("复制 AT 失败：" + ex.Message);
+            }
+        }
+
         private void CtxCopyPayPal_Click(object sender, RoutedEventArgs e)
         {
             if (AccountGrid?.SelectedItem is PoolRow row && !string.IsNullOrWhiteSpace(row.PayPalUrl))
@@ -91,7 +118,10 @@ namespace SmsWorkbench
                 MarkPayPalComplete(row);
         }
 
-        private async void CtxCheckAccountAlive_Click(object sender, RoutedEventArgs e)
+        private void CtxCheckAccountAlive_Click(object sender, RoutedEventArgs e)
+            => RunUiTask(CtxCheckAccountAliveAsync);
+
+        private async Task CtxCheckAccountAliveAsync()
         {
             if (AccountGrid?.SelectedItem is not PoolRow row || string.IsNullOrWhiteSpace(row.Identifier))
             {
@@ -125,7 +155,7 @@ namespace SmsWorkbench
                 Log($"正在进行账号测活：{row.Identifier}");
                 var args = new List<string> { "--quota-usage", "--email", row.Identifier, "--refresh-timeout", "45" };
                 AddRegistrationProxy(args);
-                string json = await Task.Run(() => RunBackendWithResult("账号测活", args));
+                string json = await RunBackendWithResultAsync("账号测活", args);
 
                 if (string.IsNullOrWhiteSpace(json))
                 {

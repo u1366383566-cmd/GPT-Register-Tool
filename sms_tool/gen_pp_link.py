@@ -104,8 +104,6 @@ try:
         redact_proxy_url,
         rotate_proxy_session as rotate_stage_proxy_session,
         _PAYPAL_PROXY_STATE_CACHE,
-        _fetch_proxy_api_url,
-        _stage_proxy_value,
         _proxy_health_cfg,
         _paypal_proxy_state,
         _proxy_pool_values,
@@ -123,8 +121,6 @@ except ImportError:  # pragma: no cover - direct script execution
         redact_proxy_url,
         rotate_proxy_session as rotate_stage_proxy_session,
         _PAYPAL_PROXY_STATE_CACHE,
-        _fetch_proxy_api_url,
-        _stage_proxy_value,
         _proxy_health_cfg,
         _paypal_proxy_state,
         _proxy_pool_values,
@@ -133,6 +129,23 @@ except ImportError:  # pragma: no cover - direct script execution
         _stage_proxy_is_configured,
         _resolve_stage_proxy,
     )
+
+
+def _paypal_config(config: Mapping[str, Any] | None) -> dict[str, Any]:
+    """Return PayPal config with the canonical protocol section applied.
+
+    The legacy top-level ``paypal`` block is still accepted, but it must not
+    reintroduce stale stage-country values when a canonical protocol method
+    configuration is present.
+    """
+    source = config if isinstance(config, Mapping) else {}
+    try:
+        from .payment_routing import method_payment_config
+
+        return method_payment_config(source, "paypal")
+    except (ImportError, TypeError, AttributeError):  # pragma: no cover - direct script execution
+        value = source.get("paypal")
+        return dict(value) if isinstance(value, Mapping) else {}
 
 try:
     from .paypal_extract import (
@@ -291,7 +304,7 @@ def run_batch(
     """
     log = emit or (lambda step, msg, **kw: print(f"[{step}] {msg}", file=sys.stderr))
     cfg = _load_json(DEFAULT_CONFIG_PATH)
-    paypal_cfg = cfg.get("paypal") if isinstance(cfg.get("paypal"), dict) else {}
+    paypal_cfg = _paypal_config(cfg)
     state = _paypal_proxy_state(paypal_cfg)
     preflight = bool(paypal_cfg.get("preflight_proxy_check", False))
     rotate_sessions = bool(paypal_cfg.get("rotate_proxy_sessions", False))
@@ -555,7 +568,7 @@ def generate_pp_link(
         {"ok": bool, "url": str, "ba_token": str, "cs_id": str, ...}
     """
     cfg = dict(runtime_config) if isinstance(runtime_config, Mapping) else _load_json(DEFAULT_CONFIG_PATH)
-    paypal_cfg = cfg.get("paypal") or {}
+    paypal_cfg = _paypal_config(cfg)
     target_country = str(target_country or paypal_cfg.get("target_country") or "GB").upper()
     regions = paypal_cfg.get("billing_regions") if isinstance(paypal_cfg.get("billing_regions"), list) else []
     checkout_country = str(
@@ -680,6 +693,14 @@ def generate_pp_link(
     }
     extractor = None
     try:
+        device_id = ""
+        if isinstance(auth_context, dict):
+            device_id = str(
+                auth_context.get("oai_did")
+                or auth_context.get("oai-device-id")
+                or auth_context.get("device_id")
+                or ""
+            ).strip()
         extractor = PPLinkExtractor(
             access_token=access_token,
             checkout_proxy=checkout_proxy,
@@ -700,8 +721,10 @@ def generate_pp_link(
             rotate_proxy_sessions=bool(paypal_cfg.get("rotate_proxy_sessions", False)),
             proxy_probe_timeout=float(paypal_cfg.get("proxy_probe_timeout_seconds", 12) or 12),
             max_stage_retries=int(paypal_cfg.get("max_stage_retries", paypal_cfg.get("max_checkout_retries", RETRY_ATTEMPTS)) or RETRY_ATTEMPTS),
+            max_checkout_retries=int(paypal_cfg.get("max_checkout_retries", RETRY_ATTEMPTS) or RETRY_ATTEMPTS),
             proxy_state=state,
             stage_proxy_countries=stage_proxy_countries,
+            device_id=device_id,
         )
         result = extractor.extract()
         ba_token = str(result.get("ba_token") or "").strip()
@@ -750,6 +773,10 @@ def generate_pp_link(
             "approve_proxy": result.get("approve_proxy", ""),
             "promotion_proxy": result.get("promotion_proxy", ""),
             "proxy_exits": result.get("proxy_exits", {}),
+            "side_effect_started": bool(result.get("side_effect_started", False)),
+            "promotion_applied": bool(result.get("promotion_applied", False)),
+            "workflow_attempt": int(result.get("workflow_attempt") or 1),
+            "last_retry_error": result.get("last_retry_error") if isinstance(result.get("last_retry_error"), dict) else {},
         }
     except PaymentOutcomeUnknownError as e:
         # A side-effect stage already ran; report the unresolved outcome instead
@@ -781,6 +808,12 @@ def generate_pp_link(
             "ok": False,
             "error": str(e),
             "error_code": "checkout_not_zero_due",
+            "error_stage": "eligibility",
+            "status": "failed",
+            "retryable": False,
+            "eligible": False,
+            "classification": "ineligible",
+            "decision": "nonzero_offer",
             "url": "",
             "ba_token": "",
             "amount": e.amount,
@@ -797,13 +830,21 @@ def generate_pp_link(
                 False,
                 str(e),
             )
+        diagnostic = e.diagnostic() if hasattr(e, "diagnostic") else {}
         return {
             "ok": False,
             "error": str(e),
+            "error_code": str(getattr(e, "error_code", "") or "payment_link_extraction_failed"),
+            "error_stage": str(getattr(e, "error_stage", "") or "adapter"),
+            "status": str(getattr(e, "status", "") or "failed"),
+            "retryable": bool(getattr(e, "retryable", False)),
             "url": "",
             "ba_token": "",
             "target_country": target_country,
             "checkout_country": checkout_country,
+            "workflow_attempt": int(getattr(extractor, "workflow_attempt", 0) or 0),
+            "last_retry_error": getattr(extractor, "last_retry_error", {}),
+            **diagnostic,
         }
 
 
@@ -926,7 +967,7 @@ def generate_chatgpt_checkout_link(
 ) -> dict[str, Any]:
     """Create a ChatGPT checkout session and return chatgpt.com/checkout/{entity}/{cs_id}."""
     cfg = _load_json(DEFAULT_CONFIG_PATH)
-    paypal_cfg = cfg.get("paypal") if isinstance(cfg.get("paypal"), dict) else {}
+    paypal_cfg = _paypal_config(cfg)
     regions = paypal_cfg.get("billing_regions") if isinstance(paypal_cfg.get("billing_regions"), list) else []
     target_country = str(
         target_country
@@ -1023,7 +1064,7 @@ def generate_hosted_long_url(
 ) -> dict[str, Any]:
     """Generate a ChatGPT/Stripe hosted checkout URL without entering BA/approve flow."""
     cfg = _load_json(DEFAULT_CONFIG_PATH)
-    paypal_cfg = cfg.get("paypal") if isinstance(cfg.get("paypal"), dict) else {}
+    paypal_cfg = _paypal_config(cfg)
     regions = paypal_cfg.get("billing_regions") if isinstance(paypal_cfg.get("billing_regions"), list) else []
     target_country = str(
         target_country

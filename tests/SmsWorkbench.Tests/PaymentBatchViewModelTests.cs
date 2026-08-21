@@ -32,10 +32,26 @@ public sealed class PaymentBatchViewModelTests
         Assert.True(service.LastRequest.ProbeOnly);
         Assert.Equal(2, service.LastRequest.Accounts.Count);
         Assert.Equal(1, service.LastRequest.Canary);
-        Assert.Equal("probe_id", service.LastRequest.BatchId);
+        Assert.StartsWith("momo_", service.LastRequest.BatchId);
+        Assert.NotEqual("probe_id", service.LastRequest.BatchId);
         Assert.Equal("正在执行 Checkout 与 Stripe init 支付能力探测...", statusDuringRun);
         Assert.True(viewModel.HasRun);
         Assert.Single(viewModel.Results);
+    }
+
+    [Fact]
+    public void PayPalAuthorizationQueueVisibilityFollowsSelectedMethod()
+    {
+        var viewModel = new PaymentBatchViewModel(
+            new StubPaymentBatchService(),
+            new StubFileLauncher(),
+            new[] { new PaymentBatchAccount("user@example.com", true) });
+
+        Assert.False(viewModel.IsPayPalSelected);
+        viewModel.SelectedMethod = viewModel.PaymentMethodOptions.First(option => option.Id == "paypal");
+        Assert.True(viewModel.IsPayPalSelected);
+        viewModel.SelectedMethod = viewModel.PaymentMethodOptions.First(option => option.Id == "momo");
+        Assert.False(viewModel.IsPayPalSelected);
     }
 
     [Fact]
@@ -79,6 +95,13 @@ public sealed class PaymentBatchViewModelTests
         viewModel.SaveProxyConfigurationCommand.Execute(null);
         Assert.Equal("http://checkout-one\nhttp://checkout-two", service.LastSaved!.CheckoutProxyPool);
         Assert.Equal("http://approve-jp\nhttp://approve-tr", service.LastSaved.ApproveProxyPool);
+        Assert.Equal("ID", service.LastSaved.CheckoutCountry);
+        Assert.Equal("JP", service.LastSaved.ApproveCountry);
+        Assert.Equal("JP", service.LastSaved.UpdateCountry);
+
+        await viewModel.TestProxiesCommand.ExecuteAsync(null);
+        Assert.Equal("ID", service.LastProbeCheckoutCountry);
+        Assert.Equal("JP", service.LastProbeApproveCountry);
     }
 
     [Fact]
@@ -270,6 +293,68 @@ public sealed class PaymentBatchViewModelTests
         Assert.True(viewModel.HasRun);
     }
 
+    [Fact]
+    public void ManualAccessTokensCreateAtRowsAndEnforceLimit()
+    {
+        var viewModel = new PaymentBatchViewModel(
+            new StubPaymentBatchService(),
+            new StubFileLauncher(),
+            Array.Empty<PaymentBatchAccount>())
+        {
+            ManualAccessTokens = "at-one\nat-two"
+        };
+
+        Assert.Equal("手动 AT 2 / 10", viewModel.AccountSummary);
+        viewModel.RunCommand.NotifyCanExecuteChanged();
+        Assert.True(viewModel.RunCommand.CanExecute(null));
+
+        viewModel.ManualAccessTokens = string.Join('\n', Enumerable.Range(1, 11).Select(i => "at-" + i));
+        Assert.False(viewModel.RunCommand.CanExecute(null));
+    }
+
+    [Fact]
+    public async Task ProgressAndHashedFinalReferenceResolveToDisplayedAccount()
+    {
+        var service = new ProgressStubPaymentBatchService();
+        var viewModel = new PaymentBatchViewModel(
+            service,
+            new StubFileLauncher(),
+            new[] { new PaymentBatchAccount("User@example.com", true) });
+
+        await viewModel.RunCommand.ExecuteAsync(null);
+
+        PaymentBatchResultRow row = Assert.Single(viewModel.Results);
+        Assert.Equal("User@example.com", row.AccountRef);
+        Assert.Equal("100%", row.ProgressText);
+        Assert.Equal("成功", row.ResultStatus);
+    }
+
+    [Fact]
+    public async Task StaleRunningEventCannotRegressTerminalRowToExecuting()
+    {
+        SynchronizationContext? previousContext = SynchronizationContext.Current;
+        SynchronizationContext.SetSynchronizationContext(new ImmediateSynchronizationContext());
+        try
+        {
+        var service = new OutOfOrderProgressPaymentBatchService();
+        var viewModel = new PaymentBatchViewModel(
+            service,
+            new StubFileLauncher(),
+            new[] { new PaymentBatchAccount("User@example.com", true) });
+
+        await viewModel.RunCommand.ExecuteAsync(null);
+
+        PaymentBatchResultRow row = Assert.Single(viewModel.Results);
+        Assert.Equal("100%", row.ProgressText);
+        Assert.Equal("成功", row.ResultStatus);
+        Assert.Equal("完成", row.CurrentStage);
+        }
+        finally
+        {
+            SynchronizationContext.SetSynchronizationContext(previousContext);
+        }
+    }
+
     private sealed class StubCountryCatalog : IPaymentCountryCatalog
     {
         private readonly IReadOnlyList<PaymentProxyCountryOption> _checkoutDefaults;
@@ -300,7 +385,7 @@ public sealed class PaymentBatchViewModelTests
                 : _approveDefaults;
     }
 
-    private sealed class StubPaymentBatchService : IPaymentBatchService
+    private class StubPaymentBatchService : IPaymentBatchService
     {
         private const string DefaultReport = """
             {
@@ -364,6 +449,8 @@ public sealed class PaymentBatchViewModelTests
         }
 
         public string? LastProbeMethod { get; private set; }
+        public string? LastProbeCheckoutCountry { get; private set; }
+        public string? LastProbeApproveCountry { get; private set; }
 
         public Task<JsonElement> ProbeProxiesAsync(
             string paymentMethod,
@@ -374,6 +461,8 @@ public sealed class PaymentBatchViewModelTests
             CancellationToken cancellationToken)
         {
             LastProbeMethod = paymentMethod;
+            LastProbeCheckoutCountry = checkoutCountry;
+            LastProbeApproveCountry = approveCountry;
             const string probe = """
                 {
                   "ok": true,
@@ -387,5 +476,44 @@ public sealed class PaymentBatchViewModelTests
             using JsonDocument document = JsonDocument.Parse(probe);
             return Task.FromResult(document.RootElement.Clone());
         }
+    }
+
+    private sealed class ProgressStubPaymentBatchService : StubPaymentBatchService, IPaymentBatchProgressService
+    {
+        public ProgressStubPaymentBatchService()
+            : base("""{"ok":true,"counts":{"requested":1},"results":[{"account_ref":"b4c9a289323b21a0","ok":true,"terminal_state":"completed"}]}""")
+        {
+        }
+
+        public Task<JsonElement> RunAsync(PaymentBatchRequest request, IProgress<BackendOutputLine> progress, CancellationToken cancellationToken)
+        {
+            string line = "@@SMSWORKBENCH_V2@@{\"schema\":\"smsworkbench.ipc.v2\",\"version\":2,\"type\":\"event\",\"terminal\":true,\"payload\":{\"domain\":\"payment\",\"account_ref\":\"b4c9a289323b21a0\",\"stage\":\"completed\",\"status\":\"completed\"}}";
+            progress.Report(new BackendOutputLine(BackendOutputChannel.StandardOutput, line));
+            using JsonDocument document = JsonDocument.Parse("{\"ok\":true,\"counts\":{\"requested\":1},\"results\":[{\"account_ref\":\"b4c9a289323b21a0\",\"ok\":true,\"terminal_state\":\"completed\"}]}");
+            return Task.FromResult(document.RootElement.Clone());
+        }
+    }
+
+    private sealed class OutOfOrderProgressPaymentBatchService : StubPaymentBatchService, IPaymentBatchProgressService
+    {
+        public OutOfOrderProgressPaymentBatchService()
+            : base("""{"ok":true,"counts":{"requested":1},"results":[{"account_ref":"b4c9a289323b21a0","ok":true,"terminal_state":"completed"}]}""")
+        {
+        }
+
+        public Task<JsonElement> RunAsync(PaymentBatchRequest request, IProgress<BackendOutputLine> progress, CancellationToken cancellationToken)
+        {
+            progress.Report(new BackendOutputLine(BackendOutputChannel.StandardOutput, Event("completed", "completed", true)));
+            progress.Report(new BackendOutputLine(BackendOutputChannel.StandardOutput, Event("adapter", "running", false)));
+            return Task.FromException<JsonElement>(new InvalidOperationException("stop after progress"));
+        }
+
+        private static string Event(string stage, string status, bool terminal)
+            => $"@@SMSWORKBENCH_V2@@{{\"schema\":\"smsworkbench.ipc.v2\",\"version\":2,\"type\":\"event\",\"terminal\":{terminal.ToString().ToLowerInvariant()},\"payload\":{{\"domain\":\"payment\",\"account_ref\":\"b4c9a289323b21a0\",\"stage\":\"{stage}\",\"status\":\"{status}\",\"account_terminal\":{terminal.ToString().ToLowerInvariant()}}}}}";
+    }
+
+    private sealed class ImmediateSynchronizationContext : SynchronizationContext
+    {
+        public override void Post(SendOrPostCallback callback, object? state) => callback(state);
     }
 }

@@ -4,7 +4,6 @@ import hashlib
 import json
 import os
 import re
-import sys
 import threading
 import time
 from dataclasses import asdict, dataclass
@@ -50,6 +49,7 @@ class ProxyProbeResult:
     country: str = ""
     region: str = ""
     error: str = ""
+    scheme: str = ""
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -131,10 +131,39 @@ def probe_proxy(
         if cached is not None:
             return cached
 
-    result = _probe_proxy_network(value, expected, stage, timeout)
+    results: list[ProxyProbeResult] = []
+    for candidate in _proxy_scheme_candidates(value):
+        result = _probe_proxy_network(candidate, expected, stage, timeout)
+        result.scheme = urlsplit(candidate).scheme.lower()
+        results.append(result)
+        if result.ok or result.error.startswith("country_mismatch:"):
+            break
+    result = results[-1]
+    if not result.ok and len(results) > 1:
+        errors = [item.error for item in results if item.error]
+        result.error = "proxy_scheme_detection_failed:" + " | ".join(errors[-3:])
     if state is not None:
         state.record_probe(value, result)
     return result
+
+
+def _proxy_scheme_candidates(proxy: str) -> list[str]:
+    """Try the declared scheme first, then compatible HTTP/SOCKS5 variants."""
+    value = normalize_proxy_url(proxy)
+    if not value:
+        return []
+    parsed = urlsplit(value)
+    scheme = parsed.scheme.lower()
+    candidates = [value]
+    alternates = {
+        "http": ("socks5h", "socks5"),
+        "https": ("http", "socks5h", "socks5"),
+        "socks5": ("socks5h", "http"),
+        "socks5h": ("socks5", "http"),
+    }.get(scheme, ())
+    suffix = value.split("://", 1)[1]
+    candidates.extend(f"{alternate}://{suffix}" for alternate in alternates)
+    return list(dict.fromkeys(candidates))
 
 
 def _probe_http_get_json(url: str, proxy: str, timeout: float) -> tuple[dict[str, Any], int]:
@@ -243,6 +272,7 @@ def select_proxy_from_pool(
     *,
     pool_loader: Any = None,
     state: "PayPalProxyState | None" = None,
+    timeout: float = 12,
 ) -> tuple[str, list[dict[str, Any]]]:
     """Return the first healthy country-matched dynamic proxy in pool order.
 
@@ -280,9 +310,9 @@ def select_proxy_from_pool(
         # Preserve the exact no-state call shape so patched probe doubles that
         # only accept (proxy, expected_country, stage, timeout) keep working.
         if state is not None:
-            result = probe_proxy(candidate, expected_country=expected, stage=stage, state=state)
+            result = probe_proxy(candidate, expected_country=expected, stage=stage, state=state, timeout=timeout)
         else:
-            result = probe_proxy(candidate, expected_country=expected, stage=stage)
+            result = probe_proxy(candidate, expected_country=expected, stage=stage, timeout=timeout)
         attempts.append({
             "proxy": redact_proxy_url(candidate),
             "ok": result.ok,
@@ -296,7 +326,10 @@ def select_proxy_from_pool(
         if state is not None:
             state.record_result(stage, candidate, result.ok, reason=result.error, country=result.country_code)
         if result.ok:
-            return candidate, attempts
+            selected = candidate
+            if result.scheme:
+                selected = result.scheme + "://" + candidate.split("://", 1)[1]
+            return selected, attempts
     return "", attempts
 
 
@@ -557,43 +590,16 @@ class PayPalProxyState:
 
 # ─── 阶段代理配置解析 (从 gen_pp_link.py 纯搬迁, 零行为变化) ────────────────────
 #
-# 本块负责把 ``paypal.stage_proxies`` / ``paypal.stage_proxy_api_urls`` /
-# ``paypal.stage_proxy_pools`` / ``paypal.proxy_health`` 解析成各阶段的实际
-# 代理值。``_PAYPAL_PROXY_STATE_CACHE`` 是进程级单例缓存, ``gen_pp_link``
-# 通过 re-export 共享同一对象 (测试会 clear 它)。
+# 本块负责把 ``paypal.stage_proxies`` / ``paypal.stage_proxy_pools`` /
+# ``paypal.proxy_health`` 解析成各阶段的实际代理值。``_PAYPAL_PROXY_STATE_CACHE``
+# 是进程级单例缓存, ``gen_pp_link`` 通过 re-export 共享同一对象 (测试会 clear 它)。
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 
 _PAYPAL_PROXY_STATE_CACHE: dict[tuple[Any, ...], PayPalProxyState] = {}
 
 
-def _fetch_proxy_api_url(api_url: str) -> str:
-    """Fetch a short-lived proxy from a plain-text proxy API such as Cliproxy white/api."""
-    api_url = str(api_url or "").strip()
-    if not api_url:
-        return ""
-    try:
-        response = requests.get(
-            api_url,
-            timeout=15,
-            headers={"User-Agent": "Mozilla/5.0 CodexATStageProxyAPI/1.0"},
-        )
-        response.raise_for_status()
-        for line in response.text.splitlines():
-            line = line.strip()
-            if line:
-                return normalize_proxy_url(line)
-    except Exception as exc:
-        print(f"[proxy_api] fetch failed: {exc}", file=sys.stderr)
-    return ""
-
-
-def _stage_proxy_value(stage_proxies: dict, api_urls: dict, key: str, fallback: str = "") -> str:
-    api_url = str((api_urls or {}).get(key) or "").strip()
-    if api_url:
-        fetched = _fetch_proxy_api_url(api_url)
-        if fetched:
-            return fetched
+def _stage_proxy_value(stage_proxies: dict, key: str, fallback: str = "") -> str:
     return str((stage_proxies or {}).get(key) or fallback or "").strip()
 
 
@@ -673,19 +679,18 @@ def _rank_stage_proxy(
 
 
 def _proxies_from_config(cfg: dict, checkout_country: str = "", target_country: str = "") -> dict:
-    """Resolve payment stage proxies from static config or proxy API URLs.
+    """Resolve payment stage proxies from the static ``paypal.stage_proxies`` config."""
+    try:
+        from .payment_routing import method_payment_config
 
-    Supports static ``paypal.stage_proxies`` and dynamic plain-text proxy APIs in
-    ``paypal.stage_proxy_api_urls``.  API values are resolved at runtime so
-    short-lived Cliproxy IP:PORT leases do not get frozen in config.json.
-    """
-    paypal_cfg = cfg.get("paypal") or {}
+        paypal_cfg = method_payment_config(cfg, "paypal")
+    except (ImportError, TypeError, AttributeError):  # pragma: no cover - direct script execution
+        paypal_cfg = cfg.get("paypal") or {}
     stage_proxies = paypal_cfg.get("stage_proxies") or {}
-    api_urls = paypal_cfg.get("stage_proxy_api_urls") or {}
     proxy_default = (cfg.get("proxy") or {}).get("default") or ""
     state = _paypal_proxy_state(paypal_cfg)
 
-    checkout_value = _stage_proxy_value(stage_proxies, api_urls, "checkout", proxy_default)
+    checkout_value = _stage_proxy_value(stage_proxies, "checkout", proxy_default)
     checkout = _rank_stage_proxy(
         paypal_cfg,
         state,
@@ -694,8 +699,8 @@ def _proxies_from_config(cfg: dict, checkout_country: str = "", target_country: 
         country=checkout_country,
     )
     provider_value = (
-        _stage_proxy_value(stage_proxies, api_urls, "provider")
-        or _stage_proxy_value(stage_proxies, api_urls, "stripe_init")
+        _stage_proxy_value(stage_proxies, "provider")
+        or _stage_proxy_value(stage_proxies, "stripe_init")
         or proxy_default
     )
     provider = _rank_stage_proxy(
@@ -706,20 +711,20 @@ def _proxies_from_config(cfg: dict, checkout_country: str = "", target_country: 
         country=target_country,
         checkout_proxy=checkout,
     )
-    stripe_init_value = _stage_proxy_value(stage_proxies, api_urls, "stripe_init") or provider
+    stripe_init_value = _stage_proxy_value(stage_proxies, "stripe_init") or provider
     stripe_init = _rank_stage_proxy(
         paypal_cfg, state, "stripe_init", stripe_init_value, country=target_country, checkout_proxy=checkout,
     )
-    payment_method_value = _stage_proxy_value(stage_proxies, api_urls, "payment_method") or provider
+    payment_method_value = _stage_proxy_value(stage_proxies, "payment_method") or provider
     payment_method = _rank_stage_proxy(
         paypal_cfg, state, "payment_method", payment_method_value, country=target_country, checkout_proxy=checkout,
     )
-    confirm_value = _stage_proxy_value(stage_proxies, api_urls, "confirm") or provider
+    confirm_value = _stage_proxy_value(stage_proxies, "confirm") or provider
     confirm = _rank_stage_proxy(
         paypal_cfg, state, "confirm", confirm_value, country=target_country, checkout_proxy=checkout,
     )
     approve_value = (
-        _stage_proxy_value(stage_proxies, api_urls, "approve")
+        _stage_proxy_value(stage_proxies, "approve")
         or confirm
         or provider
         or proxy_default
@@ -735,8 +740,8 @@ def _proxies_from_config(cfg: dict, checkout_country: str = "", target_country: 
     # Promotion stage is OPT-IN: only resolved from explicit config, no fallback
     # to provider/default, so leaving it unset keeps the original behaviour.
     promotion_value = (
-        _stage_proxy_value(stage_proxies, api_urls, "promotion")
-        or _stage_proxy_value(stage_proxies, api_urls, "promotion_update")
+        _stage_proxy_value(stage_proxies, "promotion")
+        or _stage_proxy_value(stage_proxies, "promotion_update")
     )
     promotion = _rank_stage_proxy(
         paypal_cfg,
@@ -757,8 +762,7 @@ def _proxies_from_config(cfg: dict, checkout_country: str = "", target_country: 
 
 def _stage_proxy_is_configured(paypal_cfg: dict, *keys: str) -> bool:
     stage_proxies = paypal_cfg.get("stage_proxies") if isinstance(paypal_cfg.get("stage_proxies"), dict) else {}
-    api_urls = paypal_cfg.get("stage_proxy_api_urls") if isinstance(paypal_cfg.get("stage_proxy_api_urls"), dict) else {}
-    return any(str(stage_proxies.get(key) or api_urls.get(key) or "").strip() for key in keys)
+    return any(str(stage_proxies.get(key) or "").strip() for key in keys)
 
 
 def _resolve_stage_proxy(

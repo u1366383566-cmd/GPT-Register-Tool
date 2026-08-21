@@ -19,8 +19,17 @@ namespace SmsWorkbench
             CancellationToken cancellationToken);
     }
 
-    public sealed class PaymentBatchService : IPaymentBatchService
+    public interface IPaymentBatchProgressService
     {
+        Task<JsonElement> RunAsync(
+            PaymentBatchRequest request,
+            IProgress<BackendOutputLine> progress,
+            CancellationToken cancellationToken);
+    }
+
+    public sealed class PaymentBatchService : IPaymentBatchService, IPaymentBatchProgressService
+    {
+        private static readonly string[] ListSeparators = ["\r\n", "\n", ",", ";"];
         private static readonly JsonSerializerOptions IndentedJson = new() { WriteIndented = true };
         private readonly IApplicationPaths _paths;
         private readonly IBackendClient _backendClient;
@@ -73,6 +82,8 @@ namespace SmsWorkbench
 
             string checkoutCountry = PaymentMethods.Find(method).DefaultCountry;
             string approveCountry = method == "gopay" ? "JP" : checkoutCountry;
+            string updateCountry = PaymentMethods.DefaultUpdateCountry(method, approveCountry);
+
             try
             {
                 JsonNode root = JsonNode.Parse(File.ReadAllText(Path.Combine(_paths.RootDirectory, "config.json"), Encoding.UTF8));
@@ -87,7 +98,7 @@ namespace SmsWorkbench
                 JsonObject legacyStages = legacy?["stage_proxies"] as JsonObject;
                 JsonObject legacyCountries = legacy?["stage_proxy_countries"] as JsonObject;
 
-                string[] fallbackPool = ParseList(FirstPool(protocol?["proxy_pool"]));
+                string[] fallbackPool = NormalizePool(FirstPool(protocol?["proxy_pool"]));
                 string checkoutPool = FirstPool(
                     NamedRoutePool(routes, "checkout", namedPools),
                     configured?["checkout_proxy_pool"],
@@ -119,11 +130,18 @@ namespace SmsWorkbench
                     Text(countries, "approve"),
                     Text(legacyCountries, "approve"),
                     approveCountry).ToUpperInvariant();
+                updateCountry = First(
+                    Text(countries, "promotion"),
+                    Text(countries, "update"),
+                    Text(legacyCountries, "promotion"),
+                    Text(legacyCountries, "update"),
+                    updateCountry).ToUpperInvariant();
                 return new PaymentBatchProxyConfiguration(
-                    checkoutPool,
-                    approvePool,
+                    NormalizePoolText(checkoutPool),
+                    NormalizePoolText(approvePool),
                     checkoutCountry,
-                    approveCountry);
+                    approveCountry,
+                    updateCountry);
             }
             catch
             {
@@ -131,7 +149,8 @@ namespace SmsWorkbench
                     "",
                     "",
                     checkoutCountry,
-                    approveCountry);
+                    approveCountry,
+                    updateCountry);
             }
         }
 
@@ -145,7 +164,8 @@ namespace SmsWorkbench
 
             string checkoutCountry = (configuration?.CheckoutCountry ?? "").Trim().ToUpperInvariant();
             string approveCountry = (configuration?.ApproveCountry ?? "").Trim().ToUpperInvariant();
-            if (!ValidCountry(checkoutCountry) || !ValidCountry(approveCountry))
+            string updateCountry = (configuration?.UpdateCountry ?? "").Trim().ToUpperInvariant();
+            if (!ValidCountry(checkoutCountry) || !ValidCountry(approveCountry) || !ValidCountry(updateCountry))
                 return new SettingsSaveResult(false, "代理出口国家必须为空或两位字母代码。");
 
             try
@@ -154,8 +174,8 @@ namespace SmsWorkbench
                 JsonObject methods = EnsureObject(root, "protocol_payments", "methods");
                 JsonObject proxyPools = EnsureObject(root, "protocol_payments", "proxy_pools");
                 JsonObject methodConfig = EnsureObject(methods, method);
-                string[] checkoutPool = ParseList(configuration?.CheckoutProxyPool);
-                string[] approvePool = ParseList(configuration?.ApproveProxyPool);
+                string[] checkoutPool = NormalizePool(configuration?.CheckoutProxyPool);
+                string[] approvePool = NormalizePool(configuration?.ApproveProxyPool);
                 string checkoutPoolName = method + "_checkout";
                 string approvePoolName = method + "_approve";
                 SetArray(proxyPools, checkoutPoolName, checkoutPool);
@@ -166,6 +186,7 @@ namespace SmsWorkbench
                 JsonObject routes = EnsureObject(methodConfig, "stage_routes");
                 routes["checkout"] = new JsonObject { ["pool"] = checkoutPoolName, ["country"] = checkoutCountry };
                 routes["approve"] = new JsonObject { ["pool"] = approvePoolName, ["country"] = approveCountry };
+                routes["promotion"] = new JsonObject { ["pool"] = approvePoolName, ["country"] = updateCountry };
 
                 JsonObject countries = EnsureObject(methodConfig, "stage_proxy_countries");
                 if (checkoutCountry.Length > 0)
@@ -176,6 +197,10 @@ namespace SmsWorkbench
                     countries["approve"] = approveCountry;
                 else
                     countries.Remove("approve");
+                if (updateCountry.Length > 0)
+                    countries["promotion"] = updateCountry;
+                else
+                    countries.Remove("promotion");
 
                 // Keep the first entry in the legacy singular keys for older
                 // workers; the *_proxy_pool arrays remain authoritative.
@@ -222,14 +247,26 @@ namespace SmsWorkbench
             };
         }
 
-        public async Task<JsonElement> RunAsync(PaymentBatchRequest request, CancellationToken cancellationToken)
+        public Task<JsonElement> RunAsync(PaymentBatchRequest request, CancellationToken cancellationToken)
+            => RunAsync(request, null, cancellationToken);
+
+        public async Task<JsonElement> RunAsync(
+            PaymentBatchRequest request,
+            IProgress<BackendOutputLine> progress,
+            CancellationToken cancellationToken)
         {
             string emailFile = Path.Combine(Path.GetTempPath(), "payment_batch_" + Guid.NewGuid().ToString("N") + ".txt");
             string matrixFile = Path.Combine(Path.GetTempPath(), "payment_matrix_" + Guid.NewGuid().ToString("N") + ".json");
+            string tokenFile = Path.Combine(Path.GetTempPath(), "payment_tokens_" + Guid.NewGuid().ToString("N") + ".json");
             try
             {
                 File.WriteAllLines(emailFile, request.Accounts.Select(account => account.Email), new UTF8Encoding(false));
                 File.WriteAllText(matrixFile, SerializeMatrix(request.MatrixRows, request.PaymentMethod), new UTF8Encoding(false));
+                var tokenMap = request.Accounts
+                    .Where(account => !string.IsNullOrWhiteSpace(account.AccessToken))
+                    .ToDictionary(account => account.Email, account => account.AccessToken, StringComparer.OrdinalIgnoreCase);
+                if (tokenMap.Count > 0)
+                    File.WriteAllText(tokenFile, JsonSerializer.Serialize(tokenMap), new UTF8Encoding(false));
                 var arguments = new List<string>
                 {
                     "--desktop-ipc",
@@ -242,21 +279,29 @@ namespace SmsWorkbench
                     "--payment-matrix", matrixFile,
                     "--refresh-timeout", "180"
                 };
+                if (tokenMap.Count > 0) arguments.AddRange(new[] { "--payment-token-map", tokenFile });
                 if (!request.JitRefresh) arguments.Add("--no-jit-at-refresh");
                 if (request.ProbeOnly) arguments.Add("--payment-probe-only");
+                if (request.ResumeCheckpoint) arguments.Add("--payment-resume-checkpoint");
                 if (!request.RequireZero) arguments.Add("--no-require-zero");
                 if (request.Canary > 0) arguments.AddRange(new[] { "--payment-canary", request.Canary.ToString(CultureInfo.InvariantCulture) });
                 AddPoolArgument(arguments, "--checkout-proxy-pool", request.CheckoutProxyPool);
                 AddPoolArgument(arguments, "--approve-proxy-pool", request.ApproveProxyPool);
                 AddCountryArgument(arguments, "--checkout-proxy-country", request.CheckoutCountry);
                 AddCountryArgument(arguments, "--approve-proxy-country", request.ApproveCountry);
+                AddCountryArgument(arguments, "--update-proxy-country", request.ApproveCountry);
 
                 int waveSize = request.Canary > 0 ? Math.Min(request.Canary, request.Accounts.Count) : request.Accounts.Count;
                 int waves = Math.Max(1, (int)Math.Ceiling(waveSize / (double)Math.Max(1, request.Workers)));
                 long timeout = Math.Max(120000L, (long)GetMethodTimeoutMilliseconds(request.PaymentMethod) * waves);
                 timeout = Math.Min(12L * 60 * 60 * 1000, timeout);
                 BackendCommandResult result = await _backendClient.RunAsync(
-                    BackendCommand.Create("批量协议支付", arguments, (int)timeout),
+                    BackendCommand.Create(
+                        "批量协议支付",
+                        arguments,
+                        (int)timeout,
+                        new Dictionary<string, string> { ["SMSWORKBENCH_EVENTS"] = "1" }),
+                    progress,
                     cancellationToken: cancellationToken);
 
                 if (result.TimedOut)
@@ -271,6 +316,7 @@ namespace SmsWorkbench
             {
                 TryDelete(emailFile);
                 TryDelete(matrixFile);
+                TryDelete(tokenFile);
             }
         }
 
@@ -292,6 +338,7 @@ namespace SmsWorkbench
             AddPoolArgument(arguments, "--approve-proxy-pool", approveProxyPool);
             AddCountryArgument(arguments, "--checkout-proxy-country", checkoutCountry);
             AddCountryArgument(arguments, "--approve-proxy-country", approveCountry);
+            AddCountryArgument(arguments, "--update-proxy-country", approveCountry);
 
             BackendCommandResult result = await _backendClient.RunAsync(
                 BackendCommand.Create("测试代理", arguments, 120000),
@@ -396,11 +443,17 @@ namespace SmsWorkbench
 
         private static string[] ParseList(string value)
             => (value ?? "")
-                .Split(new[] { "\r\n", "\n", ",", ";" }, StringSplitOptions.RemoveEmptyEntries)
+                .Split(ListSeparators, StringSplitOptions.RemoveEmptyEntries)
                 .Select(item => item.Trim())
                 .Where(item => item.Length > 0)
                 .Distinct(StringComparer.OrdinalIgnoreCase)
                 .ToArray();
+
+        private static string[] NormalizePool(string value)
+            => ProxyInputNormalizer.NormalizeList(value);
+
+        private static string NormalizePoolText(string value)
+            => string.Join(Environment.NewLine, NormalizePool(value));
 
         private static bool ValidCountry(string value)
             => value.Length == 0 || Regex.IsMatch(value, "^[A-Z]{2}$", RegexOptions.CultureInvariant);
@@ -461,7 +514,7 @@ namespace SmsWorkbench
 
         private static void AddPoolArgument(List<string> arguments, string option, string value)
         {
-            string normalized = string.Join(Environment.NewLine, ParseList(value));
+            string normalized = NormalizePoolText(value);
             if (normalized.Length > 0)
                 arguments.AddRange(new[] { option, normalized });
         }

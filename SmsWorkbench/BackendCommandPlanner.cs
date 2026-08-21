@@ -186,7 +186,7 @@ namespace SmsWorkbench
         {
             RequireArgument(mailboxArgument, nameof(mailboxArgument));
             RequireArgument(mailboxFile, nameof(mailboxFile));
-            IReadOnlyList<string> targets = RequireEmails(emails);
+            List<string> targets = RequireEmails(emails);
             string normalized = NormalizePhoneSource(phoneSource);
             var args = new List<string>
             {
@@ -225,7 +225,7 @@ namespace SmsWorkbench
             IReadOnlyList<string> proxyPool,
             string tempDirectory = null)
         {
-            IReadOnlyList<string> targets = RequireEmails(emails);
+            List<string> targets = RequireEmails(emails);
             var args = new List<string>
             {
                 "--refresh-local-quota",
@@ -235,7 +235,8 @@ namespace SmsWorkbench
             if (autoRelogin)
             {
                 args.Add("--quota-auto-relogin");
-                args.AddRange(new[] { "--quota-relogin-timeout", "300" });
+                args.Add("--quota-relogin-timeout");
+                args.Add("300");
             }
             var tempFiles = new List<string>();
             if (targets.Count > 1)
@@ -262,7 +263,7 @@ namespace SmsWorkbench
             IReadOnlyList<string> proxyPool,
             string tempDirectory = null)
         {
-            IReadOnlyList<string> targets = RequireEmails(emails);
+            List<string> targets = RequireEmails(emails);
             var args = new List<string>
             {
                 "--check-promotion",
@@ -320,14 +321,16 @@ namespace SmsWorkbench
         /// </summary>
         public static BackendCommandPlan CreateBatchDeleteAccounts(
             IReadOnlyList<string> emails,
+            int workers = 4,
             string tempDirectory = null)
         {
-            IReadOnlyList<string> targets = RequireEmails(emails);
+            List<string> targets = RequireEmails(emails);
             string emailFile = WriteEmailFile(tempDirectory, "delete_emails_", targets);
             var args = new List<string>
             {
                 "--delete-account",
                 "--email-file", emailFile,
+                "--workers", Count(workers),
                 "--desktop-ipc",
             };
             return new BackendCommandPlan(
@@ -349,7 +352,7 @@ namespace SmsWorkbench
             int refreshTimeoutSeconds = 60,
             string tempDirectory = null)
         {
-            IReadOnlyList<string> targets = RequireEmails(emails);
+            List<string> targets = RequireEmails(emails);
             string normalized = NormalizeImportTarget(target);
             string emailFile = WriteEmailFile(tempDirectory, "oneclick_import_emails_", targets);
             var args = new List<string>
@@ -461,7 +464,7 @@ namespace SmsWorkbench
             IReadOnlyList<string> emails,
             string tempDirectory = null)
         {
-            IReadOnlyList<string> targets = RequireEmails(emails);
+            List<string> targets = RequireEmails(emails);
             string emailFile = WriteEmailFile(tempDirectory, "paypal_completed_emails_", targets);
             var args = new List<string>
             {
@@ -535,7 +538,7 @@ namespace SmsWorkbench
         public static string MailboxArgumentForLine(string line)
         {
             string value = (line ?? "").Trim().TrimStart('﻿');
-            if (value.Length == 0 || value.StartsWith("#")) return "";
+            if (value.Length == 0 || value.StartsWith('#')) return "";
             if (value.StartsWith("cfworker://", StringComparison.OrdinalIgnoreCase)
                 || value.EndsWith("@edu.liziai.cloud", StringComparison.OrdinalIgnoreCase)
                 || value.EndsWith("@liziai.cloud", StringComparison.OrdinalIgnoreCase)) return "--mailbox-file";
@@ -543,8 +546,8 @@ namespace SmsWorkbench
             if (value.StartsWith("smailr://", StringComparison.OrdinalIgnoreCase)) return "--mailbox-file";
             if (value.StartsWith("gmail://", StringComparison.OrdinalIgnoreCase)) return "--mailbox-file";
             if (MailboxPoolFileStore.TryParseICloudUrlLine(value, out _, out _)) return "--mailbox-file";
-            if (value.Contains("----") && value.Split(new[] { "----" }, StringSplitOptions.None).Length >= 4) return "--chatai-mailbox-file";
-            if (value.Contains("---") && value.Split(new[] { "---" }, StringSplitOptions.None).Length >= 3) return "--mailbox-file";
+            if (value.Contains("----", StringComparison.Ordinal) && value.Split("----", StringSplitOptions.None).Length >= 4) return "--chatai-mailbox-file";
+            if (value.Contains("---", StringComparison.Ordinal) && value.Split("---", StringSplitOptions.None).Length >= 3) return "--mailbox-file";
             return "";
         }
 
@@ -628,7 +631,7 @@ namespace SmsWorkbench
             return trimmed;
         }
 
-        private static IReadOnlyList<string> RequireEmails(IReadOnlyList<string> emails)
+        private static List<string> RequireEmails(IReadOnlyList<string> emails)
         {
             var targets = (emails ?? Array.Empty<string>())
                 .Select(email => (email ?? "").Trim())

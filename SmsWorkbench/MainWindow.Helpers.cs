@@ -2,6 +2,25 @@ namespace SmsWorkbench
 {
     public partial class MainWindow
     {
+        private void RunUiTask(Func<Task> operation)
+            => _ = RunUiTaskAsync(operation);
+
+        private async Task RunUiTaskAsync(Func<Task> operation)
+        {
+            try
+            {
+                await operation();
+            }
+            catch (OperationCanceledException)
+            {
+            }
+            catch (Exception ex)
+            {
+                Log("界面异步操作失败：" + SensitiveDataSanitizer.Redact(ex.Message));
+                NotifyWarning("操作未完成，请查看运行日志。");
+            }
+        }
+
         // Path/config helpers, status formatting, external open/copy/log helpers.
         //
         // CLI argument construction lives in BackendCommandPlanner (window-independent,
@@ -282,8 +301,11 @@ namespace SmsWorkbench
         }
 
         private void OpenPayPalUrl(string url, string accountEmail = "")
+            => RunUiTask(() => OpenPayPalUrlAsync(url, accountEmail));
+
+        private async Task OpenPayPalUrlAsync(string url, string accountEmail = "")
         {
-            url = ResolveBackendPaymentUrl(url, accountEmail);
+            url = await ResolveBackendPaymentUrlAsync(url, accountEmail);
             if (!IsHttpUrl(url))
             {
                 Log("无效支付链接：" + url);
@@ -317,8 +339,11 @@ namespace SmsWorkbench
         }
 
         private void CopyPayPalUrl(string url, string accountEmail = "")
+            => RunUiTask(() => CopyPayPalUrlAsync(url, accountEmail));
+
+        private async Task CopyPayPalUrlAsync(string url, string accountEmail = "")
         {
-            url = ResolveBackendPaymentUrl(url, accountEmail);
+            url = await ResolveBackendPaymentUrlAsync(url, accountEmail);
             if (!IsHttpUrl(url))
             {
                 Log("无效支付链接，无法复制。");
@@ -335,12 +360,12 @@ namespace SmsWorkbench
             }
         }
 
-        private string ResolveBackendPaymentUrl(string url, string accountEmail)
+        private async Task<string> ResolveBackendPaymentUrlAsync(string url, string accountEmail)
         {
             if (!string.Equals(url, "backend://payment-url", StringComparison.OrdinalIgnoreCase)) return url;
             try
             {
-                return desktopRead.ReadPaymentUrlAsync("", accountEmail).GetAwaiter().GetResult().Trim();
+                return (await desktopRead.ReadPaymentUrlAsync("", accountEmail)).Trim();
             }
             catch (Exception ex)
             {
@@ -373,16 +398,37 @@ namespace SmsWorkbench
 
         private void Log(string text)
         {
-            string safeText = SensitiveDataSanitizer.Redact(text);
-            logger?.Information("{Message}", safeText);
-            LogText += "[" + DateTime.Now.ToString("HH:mm:ss") + "] " + safeText + Environment.NewLine;
+            LogPresanitized(SensitiveDataSanitizer.Redact(text));
+        }
+
+        /// <summary>
+        /// Appends an already-redacted line. Backend lines are redacted once in
+        /// the pump; re-redacting here (the old behaviour) doubled regex cost on
+        /// every output line.
+        /// </summary>
+        private void LogPresanitized(string safeText, bool debug = false)
+        {
+            string line = "[" + DateTime.Now.ToString("HH:mm:ss") + "] " + safeText + Environment.NewLine;
+            if (debug)
+                logger?.Debug("[backend] {Line}", safeText);
+            else
+                logger?.Information("{Message}", safeText);
+            if (LogTextBox != null && LogTextBox.IsLoaded)
+            {
+                // Append into the control directly: whole-string reassignment of
+                // LogText re-rendered the entire buffer on every line (O(n²)).
+                LogTextBox.AppendText(line);
+                logText += line; // keep the bound property consistent without re-render
+                return;
+            }
+            LogText += line;
         }
 
         private void UiLog(string text)
         {
-            string safeText = SensitiveDataSanitizer.Redact(text);
-            logger?.Debug("[backend] {Line}", safeText);
-            Dispatcher.BeginInvoke(new Action(() => Log(safeText)), DispatcherPriority.Background);
+            // Called from Progress<T> callbacks, which already post to the UI
+            // SyncContext; the extra Dispatcher.BeginInvoke was a second hop.
+            LogPresanitized(SensitiveDataSanitizer.Redact(text), debug: true);
         }
 
         private void NotifySuccess(string message)

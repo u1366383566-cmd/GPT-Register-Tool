@@ -8,7 +8,6 @@ vendored protocol extractors under ``services/protocol-payment``.
 
 from __future__ import annotations
 
-import asyncio
 import json
 import logging
 import os
@@ -26,9 +25,18 @@ from typing import Any, Callable, Mapping
 from .config import ConfigError, current_config_data, resolve_runtime_config, validate_config
 from .paths import project_path, runtime_file
 from .payment_contracts import PaymentRequest, PaymentResult, payment_history_metadata
-from .payment_catalog import PAYMENT_METHODS as CATALOG_METHODS, normalize_payment_method as normalize_catalog_payment_method
+from .payment_catalog import (
+    PAYMENT_METHODS as CATALOG_METHODS,
+    normalize_payment_method as normalize_catalog_payment_method,
+    validate_catalog_consistency,
+)
 from .payment_adapters import FunctionPaymentAdapter, PaymentAdapterRegistry
 from .payment_executor import PaymentExecutionRequest, PaymentFlowExecutor
+from .payment_operation import (
+    PaymentOperationConflict,
+    PaymentOperationStore,
+    conflict_result as payment_operation_conflict_result,
+)
 from .payment_routing import (
     PaymentRoutePlan,
     PaymentRoutePlanner,
@@ -37,6 +45,7 @@ from .payment_routing import (
     payment_proxy_pools as canonical_payment_proxy_pools,
 )
 from .sanitizer import sanitize as _canonical_sanitize, sanitize_text as _canonical_sanitize_text
+from . import payment_egress
 
 
 # Deprecated monkeypatch hook. Production callers inject RuntimeConfig or use
@@ -70,6 +79,7 @@ class PaymentMethodSpec:
     currency: str
     adapter: str
     script: str = ""
+    artifact_validator: str = "http_url"
 
 
 PAYMENT_METHODS = {
@@ -80,6 +90,7 @@ PAYMENT_METHODS = {
         definition.currency,
         {"native_paypal": "native", "native_upi": "native"}.get(definition.adapter, definition.adapter),
         definition.script,
+        definition.artifact_validator,
     )
     for key, definition in CATALOG_METHODS.items()
 }
@@ -96,21 +107,7 @@ _TRANSITIONS = {
 }
 
 _STATE_LOCK = threading.Lock()
-_URL_RE = re.compile(r"(?:https?://|upi://)[^\s\"'<>]+", re.IGNORECASE)
-_RESULT_URL_RE = re.compile(
-    r"(?im)^(?:iDEAL 最终扫码/授权 URL|Kakao/Nicepay 最终跳转 URL|"
-    r"TWINT 最终支付 URL|BLIK 支付页 URL):\s*(?:\r?\n)?"
-    r"((?:https?://|upi://)[^\s\"'<>]+)"
-)
 _BLIK_RESULT_RE = re.compile(r"BLIK_RESULT:(\{.*\})")
-_BA_TOKEN_RE = re.compile(r"BA-[A-Za-z0-9_.-]+")
-_BEARER_RE = re.compile(r"(?i)(\bBearer\s+)[A-Za-z0-9._~+/=-]+")
-_JWT_RE = re.compile(r"\beyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{4,}\b")
-_PROXY_AUTH_RE = re.compile(r"(?i)\b(https?|socks5h?)://[^\s/@]+@")
-_SENSITIVE_VALUE_RE = re.compile(
-    r"(?i)(\b(?:access[_-]?token|refresh[_-]?token|id[_-]?token|api[_-]?key|"
-    r"client[_-]?secret|password|blik[_-]?code)\b[\"']?\s*[:=]\s*[\"']?)([^\s\"'&,}]+)"
-)
 
 def build_default_payment_registry() -> PaymentAdapterRegistry:
     """Build and validate the complete adapter composition for the catalog."""
@@ -136,6 +133,7 @@ def build_default_payment_registry() -> PaymentAdapterRegistry:
                 "checkout_proxy", "provider_proxy", "stripe_init_proxy", "payment_method_proxy",
                 "confirm_proxy", "approve_proxy", "promotion_proxy", "target_country",
                 "checkout_country", "require_zero", "require_ba_token", "stage_proxy_countries",
+                "max_checkout_retries", "max_stage_retries",
             }),
         )
 
@@ -171,6 +169,16 @@ def build_default_payment_registry() -> PaymentAdapterRegistry:
     def momo_runner(*, access_token: str, proxy: Any = None, auth_context: Mapping[str, Any] | None = None, **kwargs: Any) -> dict[str, Any]:
         return _run_momo(PAYMENT_METHODS["momo"], access_token, proxy=proxy, **kwargs)
 
+    def regional_wallet_runner(*, access_token: str, proxy: Any = None, auth_context: Mapping[str, Any] | None = None, **kwargs: Any) -> dict[str, Any]:
+        method = str(kwargs.pop("payment_method"))
+        return _run_regional_wallet_adapter(
+            PAYMENT_METHODS[method],
+            access_token,
+            proxy=proxy,
+            auth_context=auth_context,
+            **kwargs,
+        )
+
     registry.register(FunctionPaymentAdapter("native_paypal", methods_for("native_paypal"), paypal_runner))
     registry.register(FunctionPaymentAdapter("native_upi", methods_for("native_upi"), upi_runner))
     registry.register(FunctionPaymentAdapter("wallet", methods_for("wallet"), wallet_runner))
@@ -178,7 +186,9 @@ def build_default_payment_registry() -> PaymentAdapterRegistry:
     registry.register(FunctionPaymentAdapter("script", methods_for("script"), script_runner))
     registry.register(FunctionPaymentAdapter("direct_card", methods_for("direct_card"), direct_runner))
     registry.register(FunctionPaymentAdapter("momo", methods_for("momo"), momo_runner))
+    registry.register(FunctionPaymentAdapter("regional_wallet", methods_for("regional_wallet"), regional_wallet_runner))
     registry.validate_methods(set(PAYMENT_METHODS))
+    validate_catalog_consistency(adapter_methods=set(registry.methods()))
     return registry
 
 
@@ -226,122 +236,6 @@ def register_payment_adapter(adapter: Any) -> Any:
     return adapter
 
 
-def _generate_payment_link_legacy(
-    access_token: str,
-    proxy: Any = None,
-    payment_method: Any = "paypal",
-    auth_context: dict[str, Any] | None = None,
-    paypal_generation_type: str | None = None,
-    progress: Callable[[dict[str, Any]], None] | None = None,
-    runtime_config: Mapping[str, Any] | None = None,
-    **kwargs: Any,
-) -> dict[str, Any]:
-    runtime_config = _config_data(runtime_config)
-    validate_config(runtime_config, workflow="protocol_payments")
-    method = normalize_payment_method(payment_method)
-    run = PaymentLinkRun(method or str(payment_method or ""))
-
-    def move(state: str, message: str) -> None:
-        run.move(state, message)
-        if progress:
-            progress(dict(run.history[-1], run_id=run.run_id, method=run.method))
-
-    try:
-        move("validating", "校验支付方式和 Access Token")
-        if not method:
-            raise ValueError(f"unsupported payment method: {payment_method}")
-        if not str(access_token or "").strip():
-            raise ValueError("access_token is required")
-        spec = PAYMENT_METHODS[method]
-        enabled = _enabled_methods(runtime_config)
-        if method not in enabled:
-            raise ValueError(f"payment method disabled by protocol_payments.enabled_methods: {method}")
-        coercion_records: list[dict[str, Any]] = []
-        proxy, kwargs = _resolve_proxy_pool_routes(
-            method, proxy, kwargs, runtime_config, coercion_records=coercion_records
-        )
-        move("preparing_proxy", "加载分段代理和协议适配器")
-        move("running", f"执行 {spec.label} 协议提链")
-
-        if bool(kwargs.get("probe_only")):
-            result = probe_payment_method(
-                access_token=access_token,
-                payment_method=method,
-                auth_context=auth_context,
-                proxy=proxy,
-                runtime_config=runtime_config,
-                **kwargs,
-            )
-        else:
-            request = PaymentRequest.create(
-                payment_method=method,
-                access_token=access_token,
-                proxy=proxy,
-                auth_context=auth_context,
-                runtime_config=runtime_config,
-                options={**kwargs, "paypal_generation_type": paypal_generation_type},
-            )
-            result = PAYMENT_ADAPTERS.execute(request).to_dict()
-
-        move("extracting", "归一化链接、二维码和协议结果")
-        normalized = _normalize_result(spec, result)
-        for record in coercion_records:
-            field = str(record.get("field") or "").strip()
-            if not field:
-                continue
-            normalized[field] = str(record.get("coerced") or "")
-            normalized[f"{field}_original"] = str(record.get("original") or "")
-            normalized[f"{field}_coerced"] = True
-        if not normalized.get("ok"):
-            terminal_state = _result_terminal_state(normalized)
-            return _finish_run(
-                run,
-                normalized,
-                terminal_state,
-                str(normalized.get("error") or f"{spec.label} extraction failed"),
-            )
-        if normalized.get("operation") == "payment_method_capability_probe":
-            completion_message = "支付方式能力探测完成"
-        elif normalized.get("operation") == "execute_payment":
-            completion_message = "BLIK 协议支付已完成"
-        else:
-            completion_message = "协议支付链接提取完成"
-        return _finish_run(run, normalized, "completed", completion_message)
-    except (KeyboardInterrupt, asyncio.CancelledError) as exc:
-        cancelled = {
-            "ok": False,
-            "status": "cancelled",
-            "error": _redact_sensitive_text(str(exc)) or "payment-link extraction cancelled",
-            "error_code": "payment_link_cancelled",
-            "error_stage": _manager_error_stage(run.state),
-            "retryable": False,
-            "payment_method": method or str(payment_method or ""),
-            "url": "",
-        }
-        return _finish_run(run, cancelled, "cancelled", cancelled["error"])
-    except Exception as exc:
-        terminal_state, error_code, retryable = _classify_exception(exc)
-        error = _redact_sensitive_text(str(exc)) or type(exc).__name__
-        failed = {
-            "ok": False,
-            "error": error,
-            "error_code": error_code,
-            "error_stage": str(
-                getattr(exc, "error_stage", "")
-                or getattr(exc, "stage", "")
-                or _manager_error_stage(run.state)
-            ),
-            "retryable": retryable,
-            "payment_method": method or str(payment_method or ""),
-            "url": "",
-        }
-        if terminal_state != "failed":
-            failed["status"] = terminal_state
-        if terminal_state == "unknown":
-            failed["requires_reconciliation"] = True
-        return _finish_run(run, failed, terminal_state, error)
-
-
 def generate_payment_link(
     access_token: str,
     proxy: Any = None,
@@ -357,6 +251,8 @@ def generate_payment_link(
     method = normalize_payment_method(payment_method)
     method_name = method or str(payment_method or "").strip().lower()
     options = dict(kwargs)
+    operation_id = str(options.pop("operation_id", "") or uuid.uuid4().hex).strip()
+    idempotency_key = str(options.pop("idempotency_key", "") or operation_id).strip()
     supplied_plan = options.pop("payment_route_plan", None)
     planning_error: Exception | None = None
     plan = supplied_plan if isinstance(supplied_plan, PaymentRoutePlan) else None
@@ -379,12 +275,12 @@ def generate_payment_link(
                 options=options,
                 default_proxy=proxy,
             )
-    except Exception as exc:
+    except (ConfigError, ValueError, TypeError, OSError, RuntimeError) as exc:
         if not getattr(exc, "error_stage", ""):
             try:
                 exc.error_stage = "validation" if isinstance(exc, (ValueError, ConfigError)) else "proxy_setup"
-            except Exception:
-                pass
+            except (AttributeError, TypeError):
+                _LOGGER.debug("could not annotate payment planning error", exc_info=True)
         planning_error = exc
         plan = PaymentRoutePlan.empty(method_name)
 
@@ -395,6 +291,42 @@ def generate_payment_link(
         routed_options["stage_proxy_countries"] = dict(options["stage_proxy_countries"])
     routed_options["payment_route_plan"] = plan
     routed_options["paypal_generation_type"] = paypal_generation_type
+    operation_name = "payment_method_capability_probe" if bool(options.get("probe_only")) else "extract_link"
+    try:
+        payment_operation = PaymentOperationStore.from_config(source).begin(
+            payment_method=method_name,
+            operation=operation_name,
+            idempotency_key=idempotency_key,
+            operation_id=operation_id,
+        )
+    except PaymentOperationConflict as exc:
+        result = payment_operation_conflict_result(exc)
+        result.update({
+            "payment_method": method_name,
+            "operation": operation_name,
+            "manager_state": result["status"],
+        })
+        _safe_persist_run(result)
+        return result
+
+    def transactional_progress(event: dict[str, Any]) -> None:
+        payload = dict(event or {})
+        stage = str(payload.get("stage") or "adapter")
+        state = str(payload.get("state") or payload.get("status") or "running")
+        potential_side_effect = operation_name != "payment_method_capability_probe" and (
+            stage == "adapter"
+            or stage in {"payment_method", "confirm", "approve", "poll", "redirect", "provider", "artifact"}
+        )
+        payment_operation.checkpoint(
+            stage,
+            state,
+            side_effect_started=True if potential_side_effect else None,
+            error_code=str(payload.get("error_code") or ""),
+        )
+        if progress is not None:
+            progress(payload)
+
+    routed_options["adapter_progress"] = transactional_progress
 
     for record in plan.coercions:
         _LOGGER.warning(
@@ -433,60 +365,26 @@ def generate_payment_link(
         normalizer=(lambda result: _normalize_result(spec, result)) if spec else None,
         exception_classifier=_classify_exception,
         error_sanitizer=_redact_sensitive_text,
-        progress=progress,
+        progress=transactional_progress,
     )
-    result = executor.run(PaymentExecutionRequest(
-        payment_method=method_name,
-        access_token=str(access_token or ""),
-        route_plan=plan,
-        auth_context=dict(auth_context or {}),
-        runtime_config=source,
-        options=routed_options,
-        operation="payment_method_capability_probe" if bool(options.get("probe_only")) else "extract_link",
-    ))
+    try:
+        result = executor.run(PaymentExecutionRequest(
+            payment_method=method_name,
+            access_token=str(access_token or ""),
+            route_plan=plan,
+            auth_context=dict(auth_context or {}),
+            runtime_config=source,
+            options=routed_options,
+            operation=operation_name,
+            operation_id=payment_operation.operation_id,
+            idempotency_key_hash=payment_operation.idempotency_key_hash,
+        ))
+        payment_operation.finish(result)
+    except BaseException:
+        payment_operation.fail_unknown("executor", "payment_executor_aborted")
+        raise
     _safe_persist_run(result)
     return result
-
-
-def _probe_payment_method_legacy(
-    access_token: str,
-    payment_method: Any,
-    *,
-    proxy: Any = None,
-    auth_context: dict[str, Any] | None = None,
-    runtime_config: Mapping[str, Any] | None = None,
-    **kwargs: Any,
-) -> dict[str, Any]:
-    """Run the method's real pre-side-effect path and return capability evidence."""
-    method = normalize_payment_method(payment_method)
-    if not method:
-        raise ValueError(f"unsupported payment method: {payment_method}")
-
-    options = dict(kwargs)
-    proxy, options = _resolve_proxy_pool_routes(method, proxy, options, runtime_config)
-    options.pop("probe_only", None)
-    if method == "gopay":
-        if "timeout_seconds" not in options and options.get("timeout") is not None:
-            options["timeout_seconds"] = options["timeout"]
-        return _run_wallet_adapter(
-            PAYMENT_METHODS[method],
-            access_token,
-            proxy=proxy,
-            auth_context=auth_context,
-            runtime_config=runtime_config,
-            probe_only=True,
-            **options,
-        )
-
-    from .payment_capability import payment_method_capability_probe
-
-    return payment_method_capability_probe(
-        access_token=access_token,
-        payment_method=method,
-        auth_context=auth_context,
-        proxy=proxy,
-        **options,
-    )
 
 
 def probe_payment_method(
@@ -532,6 +430,17 @@ def probe_payment_method(
             **options,
         )
 
+    if method in {"qris", "bizum", "naver_pay"}:
+        return _run_regional_wallet_adapter(
+            PAYMENT_METHODS[method],
+            access_token,
+            proxy=plan.checkout_proxy,
+            auth_context=auth_context,
+            runtime_config=source,
+            probe_only=True,
+            **options,
+        )
+
     from .payment_capability import payment_method_capability_probe
 
     return payment_method_capability_probe(
@@ -541,28 +450,6 @@ def probe_payment_method(
         proxy=plan.checkout_proxy,
         **options,
     )
-
-
-def _finish_run(
-    run: PaymentLinkRun,
-    result: dict[str, Any],
-    terminal_state: str,
-    message: str,
-) -> dict[str, Any]:
-    """Attach the common terminal contract and persist one final run record."""
-    run.terminate(terminal_state, message)
-    result = PaymentResult.from_mapping(
-        result,
-        payment_method=run.method,
-        terminal_state=terminal_state,
-    ).to_dict()
-    result.update({
-        "run_id": run.run_id,
-        "manager_state": run.state,
-        "state_history": run.history,
-    })
-    _safe_persist_run(result)
-    return result
 
 
 def _run_extractor_subprocess(
@@ -607,8 +494,8 @@ def _run_extractor_subprocess(
             if path:
                 try:
                     Path(path).unlink(missing_ok=True)
-                except Exception:
-                    pass
+                except OSError:
+                    _LOGGER.warning("failed to remove temporary payment credential file", exc_info=True)
 
 
 def _run_protocol_script(spec: PaymentMethodSpec, access_token: str, proxy: Any = None, **kwargs: Any) -> dict[str, Any]:
@@ -617,6 +504,11 @@ def _run_protocol_script(spec: PaymentMethodSpec, access_token: str, proxy: Any 
     script = root / spec.script
     if not script.is_file():
         return {"ok": False, "error": f"protocol extractor not found: {script}"}
+
+    try:
+        payment_egress.assert_egress_countries(kwargs, runtime_config)
+    except payment_egress.EgressCheckError as exc:
+        return exc.to_result(spec.key)
 
     cfg = _protocol_cfg(runtime_config)
     method_cfg = cfg.get("methods", {}).get(spec.key, {}) if isinstance(cfg.get("methods"), Mapping) else {}
@@ -731,10 +623,14 @@ def _run_protocol_script(spec: PaymentMethodSpec, access_token: str, proxy: Any 
                 "link_type": "blik_protocol_completed",
                 "message": completion.get("message") or "BLIK 自动提交完成",
             }
-    url = _last_payment_url(output)
-    if not url:
-        return {"ok": False, "error": _redact_sensitive_text(_tail(output)) or "extractor returned no payment URL"}
-    return {"ok": True, "url": url, "link_type": f"{spec.key}_protocol"}
+    return {
+        "ok": False,
+        "error": _redact_sensitive_text(_tail(output)) or "extractor returned no structured result",
+        "error_code": "extractor_output_missing",
+        "error_stage": "extracting",
+        "retryable": True,
+        "exit_code": proc.returncode,
+    }
 
 
 _DIRECT_CARD_CURRENCY = {
@@ -844,6 +740,47 @@ def _run_wallet_adapter(
     )
 
 
+def _run_regional_wallet_adapter(
+    spec: PaymentMethodSpec,
+    access_token: str,
+    proxy: Any = None,
+    auth_context: dict[str, Any] | None = None,
+    **kwargs: Any,
+) -> dict[str, Any]:
+    """Run a regional contract through its injected transport boundary.
+
+    No production transport is selected implicitly.  These catalog methods
+    remain disabled until a provider canary establishes the live wire contract.
+    """
+    from .regional_payment_adapter import RegionalPaymentAdapter, regional_profile
+
+    transport = kwargs.get("transport")
+    if transport is None and bool(kwargs.get("regional_transport_enabled")):
+        from .regional_payment_adapter import ChatGPTStripeRegionalTransport
+        transport = ChatGPTStripeRegionalTransport(
+            timeout=max(5, int(kwargs.get("timeout_seconds") or 45)),
+        )
+    if transport is None:
+        error = RuntimeError("regional payment adapter requires an injected transport")
+        error.error_code = "regional_transport_unconfigured"
+        error.error_stage = "adapter_setup"
+        error.retryable = False
+        raise error
+    adapter = RegionalPaymentAdapter(regional_profile(spec.key), transport)
+    return adapter.run(
+        access_token=access_token,
+        billing_country=str(kwargs.get("target_country") or kwargs.get("checkout_country") or spec.country),
+        billing_details=kwargs.get("billing_details") if isinstance(kwargs.get("billing_details"), Mapping) else None,
+        checkout_request={
+            "proxy": proxy,
+            "auth_context": dict(auth_context or {}),
+            "runtime_config": kwargs.get("runtime_config"),
+        },
+        probe_only=bool(kwargs.get("probe_only")),
+        progress=kwargs.get("adapter_progress"),
+    )
+
+
 def _run_gcash_adapter(
     spec: PaymentMethodSpec,
     access_token: str,
@@ -909,6 +846,11 @@ def _run_direct_card(spec: PaymentMethodSpec, access_token: str, proxy: Any = No
     script = root / spec.script
     if not script.is_file():
         return {"ok": False, "error": f"protocol extractor not found: {script}"}
+
+    try:
+        payment_egress.assert_egress_countries(kwargs, runtime_config)
+    except payment_egress.EgressCheckError as exc:
+        return exc.to_result(spec.key)
 
     cfg = _protocol_cfg(runtime_config)
     method_cfg = cfg.get("methods", {}).get(spec.key, {}) if isinstance(cfg.get("methods"), Mapping) else {}
@@ -1005,6 +947,11 @@ def _run_momo(spec: PaymentMethodSpec, access_token: str, proxy: Any = None, **k
     script = root / spec.script
     if not script.is_file():
         return {"ok": False, "error": f"protocol extractor not found: {script}"}
+
+    try:
+        payment_egress.assert_egress_countries(kwargs, runtime_config)
+    except payment_egress.EgressCheckError as exc:
+        return exc.to_result(spec.key)
 
     cfg = _protocol_cfg(runtime_config)
     method_cfg = cfg.get("methods", {}).get(spec.key, {}) if isinstance(cfg.get("methods"), Mapping) else {}
@@ -1130,11 +1077,19 @@ def _normalize_result(spec: PaymentMethodSpec, result: Any) -> dict[str, Any]:
             "timed_out": f"{spec.label} extraction timed out",
         }[explicit_terminal])
     capability_probe = data.get("operation") == "payment_method_capability_probe"
+    validator = spec.artifact_validator
+    artifact_ok = bool(data.get("url") or data.get("qr_data") or data.get("qr_path"))
+    if validator in {"http_url", "paypal_ba_url", "provider_redirect", "checkout_url"} and data.get("url"):
+        artifact_ok = str(data.get("url") or "").lower().startswith(("http://", "https://"))
+    elif validator == "url_or_qr":
+        artifact_ok = bool(data.get("url") or data.get("qr_data") or data.get("qr_path"))
+    elif validator == "completion":
+        artifact_ok = str(data.get("status") or "").lower() == "completed"
     if (
         data.get("ok")
         and not completed_payment
         and not capability_probe
-        and not (data.get("url") or data.get("qr_data") or data.get("qr_path"))
+        and not artifact_ok
     ):
         data["ok"] = False
         data["error"] = f"{spec.label} extractor returned no link or QR data"
@@ -1210,7 +1165,10 @@ def _normalize_error_contract(data: dict[str, Any]) -> None:
 
     terminal_state = _explicit_terminal_state(data) or "failed"
     stage = data.get("error_stage") or data.get("stage") or data.get("failed_step")
-    data["error_stage"] = str(stage or ("adapter_contract" if data.get("error_code") == "invalid_adapter_result" else "adapter")).strip() or "adapter"
+    default_stage = "adapter_contract" if data.get("error_code") == "invalid_adapter_result" else "adapter"
+    if data.get("error_code") in {"checkout_not_zero_due", "nonzero_offer", "paypal_payment_method_unavailable"}:
+        default_stage = "eligibility"
+    data["error_stage"] = str(stage or default_stage).strip() or default_stage
     data.setdefault("error", "payment-link extraction failed")
     data.setdefault("error_code", "payment_link_extraction_failed")
 
@@ -1362,119 +1320,6 @@ def _resolve_proxy_pool_routes(
     *,
     coercion_records: list[dict[str, Any]] | None = None,
 ) -> tuple[Any, dict[str, Any]]:
-    """Resolve independent checkout/approve pools before an adapter runs."""
-    values = dict(kwargs)
-    source = _config_data(runtime_config)
-    protocol = source.get("protocol_payments") if isinstance(source.get("protocol_payments"), Mapping) else {}
-    methods = protocol.get("methods") if isinstance(protocol.get("methods"), Mapping) else {}
-    canonical = methods.get(method) if isinstance(methods.get(method), Mapping) else {}
-    legacy = source.get(method) if isinstance(source.get(method), Mapping) else {}
-    method_cfg = {**dict(legacy), **dict(canonical)}
-    stage_proxies = method_cfg.get("stage_proxies") if isinstance(method_cfg.get("stage_proxies"), Mapping) else {}
-    countries = values.get("stage_proxy_countries")
-    if not isinstance(countries, Mapping):
-        countries = method_cfg.get("stage_proxy_countries") if isinstance(method_cfg.get("stage_proxy_countries"), Mapping) else {}
-    spec = PAYMENT_METHODS.get(method)
-    default_country = str(values.get("target_country") or values.get("checkout_country") or (spec.country if spec else "" )).strip().upper()
-
-    def current_proxy(stage: str) -> str:
-        aliases = {
-            "checkout": ("checkout_proxy",),
-            "approve": ("approve_proxy", "final_review_proxy", "confirm_proxy"),
-        }
-        for key in aliases[stage]:
-            value = values.get(key) or method_cfg.get(key) or stage_proxies.get(stage)
-            if value:
-                return str(value).strip()
-        return ""
-
-    from .paypal_proxy import proxy_state_from_config, select_proxy_from_pool
-
-    proxy_state = proxy_state_from_config(source)
-
-    def select(stage: str, pool_value: Any, current: str, expected: str) -> str:
-        pool = parse_proxy_pool(pool_value)
-        if not pool:
-            return current
-        selected, _attempts = select_proxy_from_pool(pool, expected, stage, state=proxy_state)
-        if not selected:
-            raise ValueError(f"{stage}_proxy_pool_unavailable")
-        return selected
-
-    checkout_pool = parse_proxy_pool(values.get("checkout_proxy_pool"))
-    approve_pool = parse_proxy_pool(values.get("approve_proxy_pool"))
-    # Injected transports own their routing in tests and local adapters.  Do
-    # not replace an explicit proxy with the global method pool in that mode.
-    if values.get("transport") is None:
-        if not checkout_pool:
-            checkout_pool = parse_proxy_pool(method_cfg.get("checkout_proxy_pool"))
-        if not approve_pool:
-            approve_pool = parse_proxy_pool(method_cfg.get("approve_proxy_pool"))
-    checkout_country = str(
-        countries.get("checkout") or values.get("checkout_country") or default_country
-    ).strip().upper()
-    approve_default_country = "JP" if method == "gopay" else default_country
-    approve_input = str(
-        countries.get("approve")
-        or values.get("approve_country")
-        or approve_default_country
-    ).strip().upper()
-    approve_country, approve_coerced = coerce_approve_country(method, approve_input)
-    # Fail fast when a PayPal-family method targets an egress country PayPal does
-    # not support, instead of discovering it mid-protocol. No-op for other methods.
-    from .payment_country_catalog import validate_paypal_country
-
-    validate_paypal_country(method, checkout_country, field="checkout_country")
-    validate_paypal_country(method, approve_country, field="approve_country")
-    if approve_coerced:
-        # Write the enforced country back so downstream stage-country rotation
-        # (wallet transport) uses the same approve egress as pool selection.
-        countries = {**dict(countries), "approve": approve_country}
-        values["stage_proxy_countries"] = countries
-        if str(values.get("approve_country") or "").strip():
-            values["approve_country"] = approve_country
-        if coercion_records is not None:
-            coercion_records.append({
-                "field": "approve_country",
-                "original": approve_input,
-                "coerced": approve_country,
-            })
-    checkout = select("checkout", checkout_pool, current_proxy("checkout"), checkout_country)
-    approve = select("approve", approve_pool, current_proxy("approve"), approve_country)
-    if checkout:
-        values["checkout_proxy"] = checkout
-        # The manager's default transport/JIT route must match Checkout.
-        proxy = checkout
-    else:
-        proxy = proxy
-    if approve:
-        values["approve_proxy"] = approve
-    # The canonical two-pool contract owns the internal adapter stages while
-    # preserving explicit per-stage values supplied by a direct caller.
-    if checkout_pool and checkout:
-        for key in (
-            "provider_proxy", "stripe_init_proxy", "payment_method_proxy",
-            "confirm_proxy", "redirect_proxy",
-        ):
-            if not str(values.get(key) or "").strip():
-                values[key] = checkout
-    if approve_pool and approve:
-        for key in ("promotion_proxy", "update_proxy", "final_review_proxy"):
-            if not str(values.get(key) or "").strip():
-                values[key] = approve
-    values.pop("checkout_proxy_pool", None)
-    values.pop("approve_proxy_pool", None)
-    return proxy, values
-
-
-def _resolve_proxy_pool_routes(
-    method: str,
-    proxy: Any,
-    kwargs: Mapping[str, Any],
-    runtime_config: Mapping[str, Any] | None = None,
-    *,
-    coercion_records: list[dict[str, Any]] | None = None,
-) -> tuple[Any, dict[str, Any]]:
     """Compatibility wrapper around the canonical payment route planner."""
     values = dict(kwargs)
     source = _config_data(runtime_config)
@@ -1587,7 +1432,7 @@ def _persist_run(result: dict[str, Any]) -> None:
 def _safe_persist_run(result: dict[str, Any]) -> None:
     try:
         _persist_run(result)
-    except Exception as exc:
+    except (OSError, TypeError, ValueError) as exc:
         result["persistence_warning"] = f"payment run state was not persisted: {type(exc).__name__}"
 
 
@@ -1596,21 +1441,11 @@ def _last_json_object(text: str) -> dict[str, Any]:
     for index in reversed([i for i, char in enumerate(text) if char == "{"]):
         try:
             value, end = decoder.raw_decode(text[index:])
-        except Exception:
+        except (json.JSONDecodeError, TypeError, ValueError):
             continue
         if isinstance(value, dict) and not text[index + end :].strip():
             return value
     return {}
-
-
-def _last_payment_url(text: str) -> str:
-    labeled = [match.group(1).rstrip(".,);]") for match in _RESULT_URL_RE.finditer(text or "")]
-    if labeled:
-        return labeled[-1]
-    urls = [match.group(0).rstrip(".,);]") for match in _URL_RE.finditer(text or "")]
-    ignored = ("api.stripe.com", "chatgpt.com/backend-api", "ipinfo.io", "ip-api.com")
-    candidates = [url for url in urls if not any(marker in url.lower() for marker in ignored)]
-    return candidates[-1] if candidates else ""
 
 
 def _tail(text: str, limit: int = 1200) -> str:
@@ -1627,7 +1462,7 @@ def _blik_completion(stdout: str) -> dict[str, Any]:
     for raw in reversed(_BLIK_RESULT_RE.findall(stdout or "")):
         try:
             value = json.loads(raw)
-        except Exception:
+        except (json.JSONDecodeError, TypeError, ValueError):
             continue
         if (
             isinstance(value, dict)
