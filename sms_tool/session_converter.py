@@ -16,7 +16,7 @@ from pathlib import Path
 from typing import Any
 
 
-FORMATS = {"cpa", "sub2api", "cockpit", "9router", "codex", "axonhub", "codexmanager"}
+FORMATS = {"cpa", "sub2api", "cockpit", "9router", "codex", "axonhub", "codexmanager", "chatgpt2api"}
 AXONHUB_PLACEHOLDER_REFRESH_TOKEN = "__missing_refresh_token__"
 
 
@@ -343,6 +343,8 @@ def convert_session(record: dict[str, Any], now: Any | None = None, source_name:
     axonhub_refresh = refresh_token or AXONHUB_PLACEHOLDER_REFRESH_TOKEN
     axonhub = strip_unavailable({"auth_mode": "chatgpt", "last_refresh": expires_at or exported_at, "tokens": {"access_token": access_token, "refresh_token": axonhub_refresh, "id_token": id_token}, "axonhub_refresh_token_placeholder": None if refresh_token else True, "axonhub_note": None if refresh_token else "refresh_token is a placeholder; access_token works only until it expires."})
     codex_manager = {"tokens": strip_unavailable({"access_token": access_token, "refresh_token": refresh_token or "", "id_token": input_id_token or "", "account_id": account_id, "chatgpt_account_id": chatgpt_account_id}), "meta": strip_unavailable({"label": name, "workspace_id": workspace_id, "chatgpt_account_id": chatgpt_account_id, "note": "Imported from ChatGPT session"})}
+    chatgpt2api_type = 'plus' if str(plan_type or '').strip().lower() == 'plus' else 'free'
+    chatgpt2api = {'access_token': access_token, 'email': email, 'user_id': user_id, 'type': chatgpt2api_type, 'source_type': 'web'}
     return {
         "sourceName": source_name,
         "sourcePath": source_path,
@@ -357,11 +359,15 @@ def convert_session(record: dict[str, Any], now: Any | None = None, source_name:
         "axonHub": axonhub,
         "codexManager": codex_manager,
         "sub2apiAccount": sub2api_account,
+        "chatgpt2api": chatgpt2api,
     }
 
 
 def build_output_document(fmt: str, converted: list[dict[str, Any]], now: Any | None = None) -> Any:
     fmt = str(fmt or "sub2api").lower()
+    if fmt == "chatgpt2api":
+        accounts = [item['chatgpt2api'] for item in converted if str(item['chatgpt2api'].get('access_token') or '').strip()]
+        return {'accounts': accounts}
     if fmt == "sub2api":
         return {"exported_at": normalize_timestamp(now or datetime.now(timezone.utc)), "proxies": [], "accounts": [item["sub2apiAccount"] for item in converted]}
     mapping = {

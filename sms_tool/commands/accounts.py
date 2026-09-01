@@ -263,6 +263,7 @@ def import_cpa(args: Any, ctx: AccountCommandContext) -> None:
 
 def check_promotion(args: Any, ctx: AccountCommandContext) -> None:
     from ..account_promotion import refresh_promotion_statuses
+    from ..cli import _proxy_pool_values
 
     emails = read_email_file(args.email_file)
     if args.email:
@@ -270,12 +271,42 @@ def check_promotion(args: Any, ctx: AccountCommandContext) -> None:
     emails = unique_emails(emails)
     if not emails:
         emails = [str(row.get("email") or "").strip() for row in ctx.list_paypal_accounts()]
-    result = refresh_promotion_statuses(
-        emails=emails,
-        workers=max(1, int(args.quota_workers or args.workers or 4)),
-        proxy=args.proxy,
-        timeout=max(5, int(args.refresh_timeout or 20)),
-    )
+
+    workers = max(1, int(args.quota_workers or args.workers or 4))
+    timeout = max(5, int(args.refresh_timeout or 20))
+    proxies = [str(item or "").strip() for item in _proxy_pool_values(args)]
+    succeeded: dict[str, dict[str, Any]] = {}
+    failed: dict[str, dict[str, Any]] = {}
+    for proxy in proxies:
+        pending = [email for email in emails if email not in succeeded]
+        if not pending:
+            break
+        report = refresh_promotion_statuses(
+            emails=pending,
+            workers=workers,
+            proxy=proxy or None,
+            timeout=timeout,
+        )
+        for item in report.get("results") or []:
+            if not isinstance(item, dict):
+                continue
+            email = str(item.get("email") or "").strip()
+            if not email:
+                continue
+            if item.get("ok"):
+                succeeded[email] = item
+            elif email not in succeeded:
+                failed[email] = item
+
+    results = [succeeded.get(email) or failed.get(email) or {"email": email, "ok": False, "promotion_status": "检测失败"} for email in emails]
+    success = sum(1 for item in results if item.get("ok"))
+    result = {
+        "ok": success == len(emails),
+        "total": len(emails),
+        "success": success,
+        "failed": len(emails) - success,
+        "results": results,
+    }
     from ..desktop_ipc import emit_result
 
     if bool(getattr(args, "desktop_ipc", False)):

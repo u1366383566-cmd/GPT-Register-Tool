@@ -235,7 +235,7 @@ namespace SmsWorkbench
             });
             header.Children.Add(new TextBlock
             {
-                Text = "TXT 保持邮箱原格式；原始 JSON 保留 session；其它格式会调用 session_converter.py 转为 CPA/Sub2API/Cockpit/9router/Codex/AxonHub/Codex-Manager。",
+                Text = "TXT 保持邮箱原格式；原始 JSON 保留 session；其它格式会调用 session_converter.py 转为 CPA/Sub2API/Cockpit/9router/Codex/AxonHub/Codex-Manager/ChatGPT2API。",
                 TextWrapping = TextWrapping.Wrap,
                 LineHeight = 20,
                 Margin = new Thickness(0, 6, 0, 0),
@@ -248,6 +248,7 @@ namespace SmsWorkbench
             combo.Items.Add(new ComboBoxItem { Content = "TXT - 邮箱----密码----客户端ID----刷新令牌", Tag = "txt" });
             combo.Items.Add(new ComboBoxItem { Content = "原始 JSON - session/auth_session", Tag = "json" });
             combo.Items.Add(new ComboBoxItem { Content = "CPA JSON", Tag = "cpa" });
+            combo.Items.Add(new ComboBoxItem { Content = "ChatGPT2API JSON", Tag = "chatgpt2api" });
             combo.Items.Add(new ComboBoxItem { Content = "Sub2API JSON", Tag = "sub2api" });
             combo.Items.Add(new ComboBoxItem { Content = "Cockpit JSON", Tag = "cockpit" });
             combo.Items.Add(new ComboBoxItem { Content = "9router JSON", Tag = "9router" });
@@ -293,6 +294,7 @@ namespace SmsWorkbench
         private string ExportFormatLabel(string format)
         {
             string value = (format ?? "").Trim().ToLowerInvariant();
+            if (value == "chatgpt2api") return "ChatGPT2API JSON";
             if (value == "sub2api") return "SUB2API JSON";
             if (value == "cockpit") return "Cockpit JSON";
             if (value == "9router") return "9router JSON";
@@ -307,6 +309,7 @@ namespace SmsWorkbench
         private string ExportFormatDescription(string format)
         {
             string value = (format ?? "").Trim().ToLowerInvariant();
+            if (value == "chatgpt2api") return "可直接在旧版 ChatGPT2API 管理界面导入的 accounts 文档";
             if (value == "sub2api") return "由 session_converter.py 生成的 Sub2API accounts 文档";
             if (value == "cockpit") return "由 session_converter.py 生成的 Cockpit/Codex 导入结构";
             if (value == "9router") return "由 session_converter.py 生成的 9router provider 结构";

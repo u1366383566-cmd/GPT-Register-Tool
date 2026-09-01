@@ -1,5 +1,7 @@
 """Tests for accounts/check plan + promotion (优惠) parsing and labels."""
 
+import json
+
 from types import SimpleNamespace
 from unittest.mock import patch
 
@@ -141,3 +143,33 @@ def test_registration_save_invokes_optional_promotion_stage(tmp_path):
     check.assert_called_once()
     assert check.call_args.args[0] == ["new@example.com"]
     assert report["promotion"] == promotion
+
+def test_check_promotion_uses_proxy_pool_fallback(monkeypatch, capsys):
+    from sms_tool.commands.accounts import AccountCommandContext, check_promotion
+
+    calls = []
+
+    def fake_refresh(*, emails, workers, proxy, timeout):
+        calls.append((list(emails), proxy, workers, timeout))
+        if proxy == "first":
+            return {"results": [{"email": email, "ok": False, "promotion_status": "检测失败"} for email in emails]}
+        return {"results": [{"email": email, "ok": True, "promotion_status": "Free·无优惠"} for email in emails]}
+
+    monkeypatch.setattr(account_promotion, "refresh_promotion_statuses", fake_refresh)
+    args = SimpleNamespace(
+        email="user@example.com",
+        email_file="",
+        quota_workers=1,
+        workers=1,
+        refresh_timeout=20,
+        proxy="first",
+        proxy_pool="second",
+        proxy_explicit=True,
+        desktop_ipc=False,
+    )
+    ctx = AccountCommandContext(list_paypal_accounts=lambda: [], get_paypal_url=lambda email: "")
+    check_promotion(args, ctx)
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["ok"] and payload["success"] == 1
+    assert payload["results"][0]["promotion_status"] == "Free·无优惠"
+    assert [proxy for _, proxy, _, _ in calls] == ["first", "second"]

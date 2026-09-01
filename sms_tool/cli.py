@@ -312,7 +312,7 @@ def main():
     parser.add_argument("--scan-relogin-mode", choices=["auto", "web_session", "codex_oauth"], default="auto", help="Relogin mode for --one-click-scan --quota-auto-relogin; auto tries RT, web session, protocol email-OTP, then Codex OAuth")
     
     parser.add_argument("--convert-session-json", default=None, help="Convert ChatGPT/Codex session JSON file to another import format")
-    parser.add_argument("--convert-format", choices=["cpa", "sub2api", "cockpit", "9router", "codex", "axonhub", "codexmanager"], default="cpa", help="Output format for --convert-session-json")
+    parser.add_argument("--convert-format", choices=["cpa", "sub2api", "cockpit", "9router", "codex", "axonhub", "codexmanager", "chatgpt2api"], default="cpa", help="Output format for --convert-session-json")
     parser.add_argument("--convert-output", default=None, help="Optional output path for --convert-session-json")
     parser.add_argument("--registration-at-only", action="store_true", default=True, help="Compatibility flag; protocol registration is AT-only by default")
     parser.add_argument("--no-2fa", action="store_true", help="Skip TOTP 2FA enrollment after a successful registration")
