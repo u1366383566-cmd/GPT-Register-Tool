@@ -16,29 +16,23 @@ namespace SmsWorkbench
         private readonly ISettingsService settingsService;
         private readonly IPaymentBatchService paymentBatchService;
         private readonly string rootDir;
-        private readonly ObservableCollection<PoolRow> allRows = new ObservableCollection<PoolRow>();
+        private readonly CancellationTokenSource _lifetimeCts = new();
         private int taskSeq = 1;
         private string searchText = "";
         private string countText = "1";
-        private string pageSizeText = "25";
+        private string pageSizeText = "100";
         private object scopeFilter = "全部";
         private string logText = "";
         private string statusText = "就绪";
         private string pageStatusText = "第 0/0 页";
         private string totalCountText = "0";
-        private string mailboxCountText = "0";
+        private string trialCountText = "0";
         private string registeredCountText = "0";
-        private string paypalCountText = "0";
         private string attentionCountText = "0";
-        private int currentPage = 1;
-        private int filteredCount;
-        private string accountSortMember = "";
-        private ListSortDirection? accountSortDirection;
         private bool sidebarCollapsed;
         private string sidebarToggleGlyph = "‹";
-        private Geometry sidebarToggleGeometry = Geometry.Parse("M15 18l-6-6 6-6");
+        private Geometry sidebarToggleGeometry = Geometry.Parse("M5 4H19A1 1 0 0 1 20 5V19A1 1 0 0 1 19 20H5A1 1 0 0 1 4 19V5A1 1 0 0 1 5 4Z M10 4V20");
         private Geometry themeIconGeometry;
-        private DispatcherTimer sidebarAnimTimer;
         private double sidebarAnimTarget;
         private double sidebarAnimStart;
         private EventHandler sidebarRenderingHandler;
@@ -103,10 +97,6 @@ namespace SmsWorkbench
 
         public ObservableCollection<TaskRow> Tasks { get; } = new ObservableCollection<TaskRow>();
 
-        public ObservableCollection<PoolRow> PagedRows { get; } = new ObservableCollection<PoolRow>();
-
-        public PoolRow SelectedRow { get; set; }
-
         public int SelectedTabIndex { get; set; }
 
         public string SearchText
@@ -124,7 +114,7 @@ namespace SmsWorkbench
         public string PageSizeText
         {
             get => pageSizeText;
-            set { pageSizeText = value ?? "25"; OnPropertyChanged(nameof(PageSizeText)); currentPage = 1; RefreshPagedRows(); }
+            set { pageSizeText = value ?? "100"; OnPropertyChanged(nameof(PageSizeText)); currentPage = 1; RefreshPagedRows(); }
         }
 
         public object ScopeFilter
@@ -163,22 +153,16 @@ namespace SmsWorkbench
             set { totalCountText = value ?? "0"; OnPropertyChanged(nameof(TotalCountText)); }
         }
 
-        public string MailboxCountText
+        public string TrialCountText
         {
-            get => mailboxCountText;
-            set { mailboxCountText = value ?? "0"; OnPropertyChanged(nameof(MailboxCountText)); }
+            get => trialCountText;
+            set { trialCountText = value ?? "0"; OnPropertyChanged(nameof(TrialCountText)); }
         }
 
         public string RegisteredCountText
         {
             get => registeredCountText;
             set { registeredCountText = value ?? "0"; OnPropertyChanged(nameof(RegisteredCountText)); }
-        }
-
-        public string PaypalCountText
-        {
-            get => paypalCountText;
-            set { paypalCountText = value ?? "0"; OnPropertyChanged(nameof(PaypalCountText)); }
         }
 
         public string AttentionCountText
@@ -223,6 +207,15 @@ namespace SmsWorkbench
             ScopeFilter = "全部";
             RefreshPools();
             ApplySidebarCompact(false);
+            Closing += OnWindowClosing;
+        }
+
+        private void OnWindowClosing(object? sender, System.ComponentModel.CancelEventArgs e)
+        {
+            // Signal in-flight async operations (refresh / export / detail / payment …)
+            // to abort instead of touching the UI after the window is gone. We do not
+            // cancel the close itself — the window still shuts down.
+            _lifetimeCts.Cancel();
         }
 
         internal MainWindow(
@@ -332,20 +325,6 @@ namespace SmsWorkbench
         public string Task { get; set; } = "";
         public string Info { get; set; } = "";
         public string Retry { get; set; } = "0";
-    }
-
-    public sealed class CollapsedLabelConverter : IValueConverter
-    {
-        public object Convert(object value, Type targetType, object parameter, CultureInfo culture)
-        {
-            var label = parameter?.ToString() ?? string.Empty;
-            return value is bool collapsed && collapsed ? string.Empty : label;
-        }
-
-        public object ConvertBack(object value, Type targetType, object parameter, CultureInfo culture)
-        {
-            throw new NotSupportedException();
-        }
     }
 
     /// <summary>

@@ -8,7 +8,7 @@ physical placement; `docs/architecture.md` defines the behavioral boundaries.
 | Path | Classification | Owner / responsibility | Notes |
 | --- | --- | --- | --- |
 | `sms_tool/` | Python application core | CLI orchestration, mailbox handling, registration, payment links, payment adapters, storage, account scans, and terminal account cleanup rules | Keep command-specific imports lazy in `sms_tool.cli`. |
-| `SmsWorkbench/` | Desktop UI | WPF launcher, account grid, themed dialogs, selected-email seam, account liveness, batch protocol-payment dialog, fixed non-payment proxy launcher, read-only SMSBower catalog adapter, local command planning/result presentation, desktop publish scripts | UI starts CLI commands; payment stage routing and other business logic stay in `sms_tool`. |
+| `SmsWorkbench/` | Desktop UI | WPF launcher, account grid, themed dialogs, selected-email seam, account liveness, mailbox-change dialog, batch protocol-payment dialog, fixed non-payment proxy launcher, read-only SMSBower catalog adapter, local command planning/result presentation, desktop publish scripts | UI starts CLI commands; payment and mailbox-change protocol logic stays in `sms_tool`. |
 | `services/` | Local provider services | Optional mailbox and payment-protocol helpers used by CLI/UI | Services expose explicit process/API boundaries and should not write account SQLite directly. |
 | `tests/` | Offline verification | Unit tests for module seams and persistence semantics | Live vendor/browser tests must be opt-in. |
 | `docs/` | Source-owned documentation | Architecture, boundaries, directory map, and operating notes | Do not place runtime logs or screenshots here unless deliberately curated. |
@@ -47,7 +47,7 @@ These directories are runtime state and are ignored by Git:
 | Group | Files | Boundary |
 | --- | --- | --- |
 | Entrypoints/config | `__main__.py`, `cli.py`, `config.py`, `paths.py`, `commands/helpers.py` | Parse global options and resolve config/paths; no vendor protocol implementation. |
-| CLI command adapters | `commands/payment.py`, `commands/payment_links.py`, `commands/registration.py`, `commands/accounts.py`, `commands/mailbox_ops.py`, `commands/one_click.py`, `commands/omakse.py` | Translate parsed CLI arguments into domain workflow requests and process exit codes; replaceable hooks arrive through explicit frozen context dataclasses. No provider wire protocol or persistence implementation. `cli.py` may retain thin compatibility wrappers only. |
+| CLI command adapters | `commands/payment.py`, `commands/payment_links.py`, `commands/registration.py`, `commands/accounts.py`, `commands/email_change.py`, `commands/mailbox_ops.py`, `commands/one_click.py`, `commands/omakse.py` | Translate parsed CLI arguments into domain workflow requests and process exit codes; replaceable hooks arrive through explicit frozen context dataclasses or keyword-injected adapters. No provider wire protocol or persistence implementation. `cli.py` retains parsing and thin dispatch only. |
 | Mailbox and phone inventory | `mailbox.py`, `mailbox_types.py`, `mailbox_parsers.py`, `mailbox_remail.py`, `mailbox_smailr.py`, `mailbox_cfworker.py`, `mailbox_graph.py`, `mailbox_gmail.py`, `mailbox_icloud_url.py`, `mailbox_chongzhi.py`, `outlook_imap.py`, `mail_otp.py`, `providers/`, `smsbower.py`, `phone_reuse.py`, `phone_proxy.py`, `sms_provider.py` | Acquire/poll mailboxes or phone activations; ReMail uses API-key-authenticated ordering and service-token pickup with adaptive OTP polling; Smailr supports configured domain IDs, restricted-domain mailbox reuse, detail-body fetch and clock-skew tolerance; Gmail receive/send and iCloud OTP-URL decoding stay inside the mailbox seam; no account persistence except through explicit callers. |
 | Registration/auth | `registration.py`, `registration_progress.py`, `registration_concurrency.py`, `cross_process_gate.py`, `registration_outcome.py`, `session_builder.py`, `account_2fa.py`, `auth_flow.py`, `auth_headers.py`, `account_creation.py`, `batch_runner.py`, `sentinel_tokens.py`, `sentinel_quickjs.py`, `otp_strategy.py`, `auth_state.py`, `error_classification.py`, `codex_oauth.py`, `codex_sentinel.py`, `codex_phone.py`, `session_refresh.py` | ChatGPT/OpenAI auth, OTP, Sentinel, session refresh, optional phone verification, progress persistence, in-process stage resource gates plus OS file-lock slots shared by desktop/CLI processes, result judgment, canonical session assembly, and TOTP 2FA enrollment. |
 | Agent Identity / explicit import | `agent_identity.py`, `sub2api_import.py` | Ed25519 credential conversion for explicit SUB2API import; not called by the registration pipeline. Keys are persisted under `sessions/agent_identities/`. |
@@ -56,8 +56,9 @@ These directories are runtime state and are ignored by Git:
 | Account cleanup | `account_cleanup.py`, `scripts/cleanup_invalid_accounts.py`, `scripts/mailbox_pool_orphans.py` | Classify only terminal dropped/deactivated/missing-AT/token-invalid rows and archive/delete their local representations; unknown transport results are retained. `mailbox_pool_orphans.py` is a read-only pool/DB/session reconciliation report that prunes only no-session orphans with `--apply` (dry-run + pool backup by default). |
 | Payment links and capability | `payment_link_manager.py`, `payment_auth.py`, `checkout_contract.py`, `payment_capability.py`, `payment_flow.py`, `payment_routing.py`, `payment_executor.py`, `gen_pp_link.py`, `wallet_provider.py`, `wallet_transport.py`, `gcash_provider.py`, `gcash_transport.py`, `paypal_proxy.py`, `paypal_reverse.py` | JIT AT gate, canonical Checkout/Stripe init contract, shared stage vocabulary, immutable method-owned route plans, common execution states, provider-aware side-effect-limited probing, unified terminal results, native/shared-wallet/custom-payment adapters, link reuse, and stage proxy resolution. Promotion/Update is supported by PayPal and by GoPay full/probe zero-due flows; see [`paypal-zero-due-link.md`](paypal-zero-due-link.md) for PayPal details. |
 | Payment batch execution | `payment_batch.py` | Stable email cohorts, JIT refresh, capability-aware eligibility matrix, method concurrency, canary pause, classified retry, and atomic token-free checkpoints under `runtime/payment_batches/`. |
-| Payment execution and reconciliation | `paypal_auto.py`, `paypal_protocol.py`, `paypal_reconciliation.py`, `nodriver_paypal.py`, `omakse_client.py` | Execute explicit payment commands or independently reconcile an allowlisted PayPal merchant return; reconciliation does not alter the payment-link interface. |
+| Payment execution and reconciliation | `paypal/` (`orchestrator.py`, `flow_steps.py`, `form_steps.py`, `session.py`, `dom_fields.py`, `config_picker.py`, `errors.py`), `paypal_auto.py`, `paypal_protocol.py`, `paypal_reconciliation.py`, `nodriver_paypal.py`, `omakse_client.py` | Execute explicit payment commands or independently reconcile an allowlisted PayPal merchant return; reconciliation does not alter the payment-link interface. `paypal/` splits browser automation into seven layers (orchestration, flow, form, session, DOM, config, errors) with a one-way dependency direction; `paypal_auto.py` is only a back-compat re-export shim. |
 | Account data/import/export | `account_seed.py`, `storage.py`, `codex_export.py`, `cpa_import.py`, `sub2api_import.py`, `session_converter.py`, `import_targets.py` | Normalize account/session state, convert between formats, and upload to external import targets (CPA, SUB2API); CPA import does not own local liveness or recovery. |
+| Email change workflow | `account_email_change.py`, `commands/email_change.py`, `storage.py` | Allocate target mailboxes, perform eligibility/begin/OTP/verify, relogin and liveness verification, then atomically migrate the account/session identity. CLI adapter only maps arguments; storage owns the final migration transaction. |
 | Desktop read transport | `desktop_read.py`, `desktop_serve.py` and `SmsWorkbench/DesktopReadClient.cs` | Sanitized account/mailbox read contracts, resident request-ID-correlated JSONL transport, one-shot fallback, process restart, and file-metadata caches. No registration or payment mutation. |
 | Shared utilities | `http_client.py`, `captcha_solver.py`, `nodriver_captcha.py`, `proxy_pool.py`, `doctor.py`, `utils.py` | Reusable transport/browser/helper logic and offline environment diagnostics with minimal state ownership. |
 
@@ -70,6 +71,22 @@ These directories are runtime state and are ignored by Git:
 | `PaymentBatchService.cs`, `PaymentBatchViewModel.cs` | Batch dialog execution and state; do not duplicate single-account command planning. |
 | `PaymentMethods.cs` | Canonical desktop payment-method catalog, aliases, countries, and single/batch availability. |
 | `AccountGridPresentation.cs` | Promotion status classification plus full filtered-set ordering before pagination. |
+
+## `SmsWorkbench/` mailbox-change boundary
+
+| File | Responsibility |
+| --- | --- |
+| `ChangeEmailDialogService.cs` | Build and validate the provider/concurrency/credential selection dialog; no backend calls or account mutation. |
+| `MainWindow.ContextMenu.cs` | Resolve selected account rows and invoke the backend command; no provider allocation or ChatGPT protocol implementation. |
+| `BackendCommandPlanner.cs` | Build the deterministic `--change-email` command and temporary account list. |
+
+## `SmsWorkbench/` shell presentation boundary
+
+| File | Responsibility |
+| --- | --- |
+| `MainWindow.Theme.cs`, `WindowThemeService.cs` | Apply application resource colors and propagate the selected theme to open windows. |
+| `MainWindow.Sidebar.cs` | Sidebar collapsed state, icon state and the bounded width animation only. |
+| `MainWindow.WindowChrome.cs` | Custom title-bar drag, minimize, maximize and close commands only. |
 
 ## `SmsWorkbench/` window-independent backend interpreters
 

@@ -3,7 +3,10 @@
 from __future__ import annotations
 
 import json
+import os
+import shutil
 import sys
+import tempfile
 from collections.abc import Mapping, MutableMapping
 from contextlib import contextmanager
 from contextvars import ContextVar
@@ -17,6 +20,182 @@ from urllib.parse import urlsplit
 
 class ConfigError(ValueError):
     pass
+
+
+# ---- Config sharding (proxy.json / runtime.json / payment.json) ----
+# The historical single config.json is split into three focused shard files.
+# Both the desktop shell and the Python backend merge these shards at load time,
+# and a legacy config.json is migrated into shards on first load.
+SHARD_FILES: dict[str, str] = {
+    "proxy": "proxy.json",
+    "runtime": "runtime.json",
+    "payment": "payment.json",
+}
+# Top-level config key -> owning shard name. Every key present in config.json
+# must be listed here so writes can be routed to the correct shard.
+SHARD_OWNERSHIP: dict[str, str] = {
+    # runtime.json
+    "runtime": "runtime",
+    "timeouts": "runtime",
+    "storage": "runtime",
+    "output": "runtime",
+    "account_health": "runtime",
+    "registration": "runtime",
+    "chatgpt": "runtime",
+    "email_registration": "runtime",
+    "codex_oauth": "runtime",
+    # proxy.json
+    "proxy": "proxy",
+    "mailbox_proxy": "proxy",
+    "phone_reuse": "proxy",
+    "paypal_browser": "proxy",
+    # payment.json
+    "paypal": "payment",
+    "paypal_nocard": "payment",
+    "upi": "payment",
+    "omakse": "payment",
+    "protocol_payments": "payment",
+    "kakao": "payment",
+    "momo": "payment",
+    "cpa_mode": "payment",
+    "sub2api": "payment",
+}
+_CONFIG_DIR = Path(__file__).resolve().parent.parent  # project root
+
+
+def _deep_merge(target: dict, source: Mapping) -> None:
+    for key, value in source.items():
+        if key in target and isinstance(target[key], dict) and isinstance(value, dict):
+            _deep_merge(target[key], value)
+        else:
+            target[key] = value
+
+
+def _split_into_shards(data: Mapping[str, Any]) -> dict[str, dict]:
+    shards: dict[str, dict] = {name: {} for name in SHARD_FILES}
+    for key, value in data.items():
+        owner = SHARD_OWNERSHIP.get(key, "runtime")
+        shards[owner][key] = value
+    return shards
+
+
+def _atomic_write_json(path: Path, data: Mapping[str, Any]) -> None:
+    """Write JSON atomically: a temp file in the *same* directory + ``os.replace``.
+
+    The temp file lives beside the target so ``os.replace`` is a same-volume
+    rename (atomic on Windows, no truncated-file window). A ``.bak`` copy of
+    the previous content is kept first, because the three shard files *are*
+    the whole application configuration — a crash mid-write used to leave a
+    truncated JSON and take the app down with it.
+    """
+    directory = path.parent
+    directory.mkdir(parents=True, exist_ok=True)
+    backup = path.with_name(path.name + ".bak")
+    if path.exists():
+        try:
+            shutil.copy2(path, backup)
+        except OSError:
+            # Best-effort only; a missing/locked backup must not fail the write.
+            pass
+    prefix = "." + path.stem + "."
+    fd, tmp_name = tempfile.mkstemp(dir=directory, prefix=prefix, suffix=".tmp")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            handle.write(json.dumps(dict(data), indent=2, ensure_ascii=False) + "\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(tmp_name, path)
+    except BaseException:
+        try:
+            os.unlink(tmp_name)
+        except OSError:
+            pass
+        raise
+
+
+def _write_shards(shards: Mapping[str, Mapping], config_dir: Path) -> None:
+    for name, filename in SHARD_FILES.items():
+        _atomic_write_json(config_dir / filename, dict(shards[name]))
+
+
+def load_merged_config() -> dict[str, Any]:
+    """Merge the proxy/runtime/payment shards into a single config dict.
+
+    Honors a legacy single config.json by migrating it into shards on first
+    load. Returns {} when no configuration exists.
+    """
+    shard_paths = [(name, _CONFIG_DIR / filename) for name, filename in SHARD_FILES.items()]
+    if any(path.exists() for _, path in shard_paths):
+        merged: dict[str, Any] = {}
+        for _, path in shard_paths:
+            if not path.exists():
+                continue
+            with open(path, encoding="utf-8-sig") as handle:
+                data = json.load(handle)
+            if isinstance(data, dict):
+                _deep_merge(merged, data)
+        return merged
+    legacy = _CONFIG_DIR / "config.json"
+    if legacy.exists():
+        with open(legacy, encoding="utf-8-sig") as handle:
+            data = json.load(handle)
+        if isinstance(data, dict):
+            _write_shards(_split_into_shards(data), _CONFIG_DIR)
+            return dict(data)
+    return {}
+
+
+
+
+def validate_registration_driver_config(
+    config: Mapping[str, Any],
+    driver: Any = None,
+    *,
+    proxy: Any = None,
+) -> str:
+    """Validate credentials required by the selected browser driver.
+
+    Static ``validate_config`` checks types and URL shapes, but cannot require
+    credentials for every optional driver.  This focused preflight is called at
+    the registration boundary so a missing cloud/API setting is reported before
+    a disposable mailbox is claimed or a browser session is created.
+    """
+    from .registration_drivers.base import normalize_registration_driver
+
+    selected = normalize_registration_driver(driver, config)
+    if selected == "protocol":
+        return selected
+
+    registration = config.get("registration")
+    registration = registration if isinstance(registration, Mapping) else {}
+    drivers = registration.get("drivers")
+    drivers = drivers if isinstance(drivers, Mapping) else {}
+    selected_config = drivers.get(selected)
+    selected_config = selected_config if isinstance(selected_config, Mapping) else {}
+    # Use the same environment-overlay logic as the runtime session factory so
+    # preflight does not reject a driver whose credentials live in deployment
+    # environment variables.
+    try:
+        from .registration_drivers.external_sessions import _driver_config
+
+        selected_config = _driver_config(config, selected)
+    except Exception:
+        selected_config = dict(selected_config)
+
+    # Cloud browser secrets may be injected by deployment environments.  Keep
+    # environment precedence at the validation boundary without mutating the
+    # persisted JSON configuration.
+    requirements = {
+        "roxy": (("workspace_id", "roxy_workspace_id_missing"),),
+    }
+    for key, error_code in requirements.get(selected, ()):
+        configured = selected_config.get(key)
+        if not str(configured or "").strip():
+            raise ConfigError(error_code)
+    # ``proxy`` stays in the signature for call-site stability; every remaining
+    # driver consumes the registration proxy locally, so there is no
+    # "provider-native proxy setting required" case left to validate.
+    return selected
 
 
 def _freeze(value: Any) -> Any:
@@ -139,7 +318,16 @@ def default_config_path() -> Path:
 
 
 def load_runtime_config(path: str | Path | None = None, *, validate: bool = True) -> RuntimeConfig:
-    source = Path(path).expanduser().resolve() if path else default_config_path()
+    if path is None:
+        # Merge the proxy/runtime/payment shards (migrating a legacy single
+        # config.json on first load). This is the canonical desktop + backend path.
+        raw = load_merged_config()
+        if not isinstance(raw, dict):
+            raise ConfigError("merged config root must be a JSON object")
+        if validate:
+            validate_config(raw)
+        return RuntimeConfig(data=_freeze(raw), source=_CONFIG_DIR)
+    source = Path(path).expanduser().resolve()
     if not source.is_file():
         raise ConfigError(f"config file not found: {source}")
     try:
@@ -150,13 +338,13 @@ def load_runtime_config(path: str | Path | None = None, *, validate: bool = True
         raise ConfigError("config root must be a JSON object")
     if validate:
         validate_config(raw)
-    if path is None and source == Path(__file__).resolve().parent / "config.json":
+    if source == Path(__file__).resolve().parent / "config.json":
         # The bundled package config is a minimal safe fallback (endpoints and
         # paths only). Running on it means the project-root config.json is
         # missing, so say so loudly instead of silently flipping behavior.
         print(
             f"[!] Using the bundled fallback config {source}; "
-            f"create a project-root config.json (see config.example.json) for full behavior",
+            f"create a project-root config (see config.example.json) for full behavior",
             file=sys.stderr,
         )
     return RuntimeConfig(data=_freeze(raw), source=source)
@@ -194,15 +382,93 @@ def validate_config(config: Mapping[str, Any], *, workflow: str | None = None) -
         pool = proxy.get("pool", [])
         if pool is not None and not isinstance(pool, (list, tuple)):
             errors.append("proxy.pool must be an array")
+        for key in (
+            "browser_registration_pool",
+            "browser_pool",
+            "protocol_registration_pool",
+            "protocol_pool",
+        ):
+            if key in proxy and not isinstance(proxy.get(key), (str, list, tuple)):
+                errors.append(f"proxy.{key} must be a proxy list")
+        if "health" in proxy and not isinstance(proxy.get("health"), (str, list, tuple)):
+            errors.append("proxy.health must be a proxy list")
+
+    account_health = config.get("account_health", {})
+    if account_health is not None and not isinstance(account_health, Mapping):
+        errors.append("account_health must be an object")
+    if isinstance(account_health, Mapping):
+        if "proxy_pool" in account_health and not isinstance(
+            account_health.get("proxy_pool"), (str, list, tuple)
+        ):
+            errors.append("account_health.proxy_pool must be a proxy list")
+        health_proxies = account_health.get("proxies", {})
+        if health_proxies is not None and not isinstance(health_proxies, Mapping):
+            errors.append("account_health.proxies must be an object")
+        elif isinstance(health_proxies, Mapping):
+            supported_health_lanes = {
+                "liveness", "liveness_pool", "quota_pool",
+                "promotion", "promotion_pool",
+                "browser", "browser_pool", "browser_verification_pool",
+            }
+            unknown_health_lanes = sorted(set(health_proxies) - supported_health_lanes)
+            if unknown_health_lanes:
+                errors.append(
+                    "unsupported account_health proxy lane: "
+                    + ", ".join(unknown_health_lanes)
+                )
+            for key, value in health_proxies.items():
+                if not isinstance(value, (str, list, tuple)):
+                    errors.append(f"account_health.proxies.{key} must be a proxy list")
 
     registration = config.get("registration", {})
     if registration is not None and not isinstance(registration, Mapping):
         errors.append("registration must be an object")
     if isinstance(registration, Mapping):
+        driver = str(registration.get("driver") or "protocol").strip().lower().replace("-", "_")
+        if driver not in {
+            "protocol", "api", "http", "playwright", "pw",
+            "browser", "browser_registration", "fingerprint", "fingerprint_browser",
+            "roxy", "roxybrowser", "roxy_browser", "cloak", "cloakbrowser", "cloak_browser",
+            "camoufox", "camou", "fox", "cf",
+        }:
+            errors.append("registration.driver is unsupported")
         _validate_positive_numbers(registration, (
             "retry_attempts", "retry_delay_seconds", "at_stability_probe_count",
-            "at_stability_probe_delay_seconds", "at_probe_timeout_seconds",
+            "at_stability_probe_delay_seconds", "at_probe_timeout_seconds", "browser_timeout_seconds",
         ), "registration", errors)
+        if "browser_headless" in registration and not isinstance(registration.get("browser_headless"), bool):
+            errors.append("registration.browser_headless must be a boolean")
+        for key in ("browser_locale", "browser_timezone"):
+            if key in registration and not str(registration.get(key) or "").strip():
+                errors.append(f"registration.{key} must not be blank")
+        drivers = registration.get("drivers", {})
+        if drivers is not None and not isinstance(drivers, Mapping):
+            errors.append("registration.drivers must be an object")
+        elif isinstance(drivers, Mapping):
+            supported_drivers = {"roxy", "cloak", "playwright", "camoufox", "adspower"}
+            unknown_drivers = sorted(set(drivers) - supported_drivers)
+            if unknown_drivers:
+                errors.append(f"unsupported registration driver config: {', '.join(unknown_drivers)}")
+            for name, raw in drivers.items():
+                if not isinstance(raw, Mapping):
+                    errors.append(f"registration.drivers.{name} must be an object")
+                    continue
+                for key in ("api_base", "cdp_base", "start_url"):
+                    value = str(raw.get(key) or "").strip()
+                    if value and urlsplit(value).scheme not in {"http", "https", "ws", "wss"}:
+                        errors.append(f"registration.drivers.{name}.{key} must be a URL")
+                _validate_positive_numbers(
+                    raw,
+                    ("session_timeout_minutes",),
+                    f"registration.drivers.{name}",
+                    errors,
+                )
+                for key in (
+                    "use_proxy", "humanize", "geoip", "keep_browser_open",
+                    "delete_profile_after_run", "generate_browser_profile", "ad_blocker",
+                ):
+                    if key in raw and not isinstance(raw.get(key), bool):
+                        errors.append(f"registration.drivers.{name}.{key} must be a boolean")
         stage_timeouts = registration.get("stage_timeouts", {})
         if stage_timeouts is not None and not isinstance(stage_timeouts, Mapping):
             errors.append("registration.stage_timeouts must be an object")
@@ -220,6 +486,35 @@ def validate_config(config: Mapping[str, Any], *, workflow: str | None = None) -
                 stage_timeouts,
                 tuple(str(key) for key in stage_timeouts),
                 "registration.stage_timeouts",
+                errors,
+            )
+        pulse = registration.get("pulse", {})
+        if pulse is not None and not isinstance(pulse, Mapping):
+            errors.append("registration.pulse must be an object")
+        elif isinstance(pulse, Mapping):
+            if "enabled" in pulse and not isinstance(pulse.get("enabled"), bool):
+                errors.append("registration.pulse.enabled must be a boolean")
+            _validate_positive_numbers(
+                pulse,
+                ("wave_size", "wave_delay_seconds", "ban_threshold",
+                 "ban_pause_seconds", "max_waves"),
+                "registration.pulse",
+                errors,
+            )
+        process_pool = registration.get("browser_process_pool", {})
+        if process_pool is not None and not isinstance(process_pool, Mapping):
+            errors.append("registration.browser_process_pool must be an object")
+        elif isinstance(process_pool, Mapping):
+            # NOTE: deliberately NOT named ``browser_pool`` -- that key is a
+            # proxy-pool alias (see proxy_routing.PROXY_LANE_ALIASES); reusing
+            # it here would make every future grep ambiguous.
+            for key in ("enabled", "recycle_on_error"):
+                if key in process_pool and not isinstance(process_pool.get(key), bool):
+                    errors.append(f"registration.browser_process_pool.{key} must be a boolean")
+            _validate_positive_numbers(
+                process_pool,
+                ("max_concurrent", "max_uses_per_process"),
+                "registration.browser_process_pool",
                 errors,
             )
 

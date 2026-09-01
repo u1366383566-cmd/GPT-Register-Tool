@@ -244,7 +244,9 @@ def _chongzhi_matcher(mailbox: Any, cfg: Mapping[str, Any]) -> bool:
     from .mailbox_chongzhi import chongzhi_enabled
     provider = str(getattr(mailbox, "provider", "") or "").strip().lower()
     return provider == "chongzhi" or (
-        chongzhi_enabled(dict(cfg)) and bool(str(getattr(mailbox, "password", "") or "").strip())
+        not provider
+        and chongzhi_enabled(dict(cfg))
+        and bool(str(getattr(mailbox, "password", "") or "").strip())
     )
 
 

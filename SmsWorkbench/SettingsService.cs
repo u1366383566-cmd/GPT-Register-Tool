@@ -23,7 +23,10 @@ namespace SmsWorkbench
         public SettingsService(IApplicationPaths paths)
         {
             _paths = paths;
-            ConfigPath = Path.Combine(paths.RootDirectory, "config.json");
+            // Configuration now lives in the proxy/runtime/payment shard files
+            // under the application root; expose the directory so "Open config"
+            // reveals the full sharded layout.
+            ConfigPath = paths.RootDirectory;
         }
 
         public string ConfigPath { get; }
@@ -104,11 +107,10 @@ namespace SmsWorkbench
                 // switch the purchase flow back to code mode.
                 SetPath(root, "email_registration.remail.service_mode", "purchase");
                 // phone_reuse.py defaults source to "auto", which falls back to the static
-                // phone pool when no phone vendor key is configured.  The desktop surface
-                // intentionally dropped static phone-pool editing, so pin the vendor seam
-                // here: 5sim wins when it is configured (user preference), otherwise
-                // SMSBower keeps the legacy default.
-                SetPath(root, "phone_reuse.source", ResolvePhoneSource(fields));
+                // phone pool when no SMSBower key is configured.  The desktop surface
+                // intentionally dropped static phone-pool editing, so keep pinning the
+                // SMSBower seam here.
+                SetPath(root, "phone_reuse.source", "smsbower");
                 RemovePath(root, "phone_reuse.smsbower.pool_size");
                 RemovePath(root, "phone_reuse.phone_pool");
                 RemovePath(root, "protocol_payments.methods.blik.blik_code");
@@ -165,40 +167,47 @@ namespace SmsWorkbench
         }
 
         // Read-only access used by MainWindow helpers.  Unlike Load/Save this never
-        // creates config.json and parses case-insensitively, matching the legacy
+        // creates config and parses case-insensitively, matching the legacy
         // dictionary-based readers it replaces; any failure yields the fallback.
-        // The parsed root is cached on (mtime, size) so hot loops reading settings
+        // The merged root (from the proxy/runtime/payment shards, migrated from a
+        // legacy config.json on first load) is cached on a signature of the
+        // underlying files' existence/mtime/size so hot loops reading settings
         // (account-grid refresh reads the file once per row) no longer re-read and
-        // re-parse config.json on every GetString.
-        private JsonObject cachedRoot;
-        private DateTime cachedRootWriteUtc;
-        private long cachedRootSize = -1;
+        // re-parse on every GetString.
+        private JsonObject? cachedRoot;
+        private string cachedSignature = "";
         private readonly object rootCacheLock = new();
 
-        private JsonObject ReadRootIfExists()
+        private JsonObject? ReadRootIfExists()
         {
             lock (rootCacheLock)
             {
-                if (!File.Exists(ConfigPath))
-                {
-                    cachedRoot = null;
-                    cachedRootSize = -1;
-                    return null;
-                }
-                FileInfo info = new(ConfigPath);
-                if (cachedRoot != null
-                    && cachedRootWriteUtc == info.LastWriteTimeUtc
-                    && cachedRootSize == info.Length)
-                {
+                string signature = ConfigSignature();
+                if (cachedRoot is not null && signature == cachedSignature)
                     return cachedRoot;
-                }
-                cachedRoot = JsonNode.Parse(
-                    File.ReadAllText(ConfigPath, Encoding.UTF8),
-                    new JsonNodeOptions { PropertyNameCaseInsensitive = true }) as JsonObject;
-                cachedRootWriteUtc = info.LastWriteTimeUtc;
-                cachedRootSize = info.Length;
+                cachedRoot = ConfigStore.ReadMerged(_paths);
+                cachedSignature = signature;
                 return cachedRoot;
             }
+        }
+
+        private string ConfigSignature()
+        {
+            var builder = new System.Text.StringBuilder();
+            foreach (string file in ConfigStore.AllConfigFiles(_paths))
+            {
+                if (File.Exists(file))
+                {
+                    FileInfo info = new(file);
+                    builder.Append('E').Append(info.LastWriteTimeUtc.Ticks)
+                        .Append(':').Append(info.Length).Append('|');
+                }
+                else
+                {
+                    builder.Append('M').Append('|');
+                }
+            }
+            return builder.ToString();
         }
 
         private static string ReadValue(JsonObject root, SettingDefinition definition)
@@ -237,43 +246,23 @@ namespace SmsWorkbench
 
         private JsonObject ReadRoot()
         {
-            EnsureConfigFile();
-            return JsonNode.Parse(File.ReadAllText(ConfigPath, Encoding.UTF8)) as JsonObject ?? new JsonObject();
-        }
-
-        private void EnsureConfigFile()
-        {
-            if (File.Exists(ConfigPath)) return;
-            string example = Path.Combine(_paths.RootDirectory, "config.example.json");
-            if (File.Exists(example)) File.Copy(example, ConfigPath);
-            else File.WriteAllText(ConfigPath, "{}", new UTF8Encoding(false));
+            // Merge the proxy/runtime/payment shards (or migrate a legacy single
+            // config.json); an empty object keeps the save path functional before
+            // any configuration exists.
+            return ConfigStore.ReadMerged(_paths) ?? new JsonObject();
         }
 
         private void WriteAtomic(JsonObject root)
         {
-            string temporary = ConfigPath + ".tmp." + Guid.NewGuid().ToString("N");
-            try
+            // Persist the merged configuration back into the proxy/runtime/payment
+            // shard files, routing each top-level key to its owning shard. This is
+            // the single write boundary shared by Settings and the batch payment
+            // service.
+            ConfigStore.WriteShards(_paths, root);
+            lock (rootCacheLock)
             {
-                File.WriteAllText(
-                    temporary,
-                    root.ToJsonString(IndentedJson),
-                    new UTF8Encoding(false));
-                File.Move(temporary, ConfigPath, overwrite: true);
-                lock (rootCacheLock)
-                {
-                    cachedRoot = null; // force re-parse on next read
-                    cachedRootSize = -1;
-                }
-            }
-            finally
-            {
-                try
-                {
-                    if (File.Exists(temporary)) File.Delete(temporary);
-                }
-                catch
-                {
-                }
+                cachedRoot = null; // force re-merge on next read
+                cachedSignature = "";
             }
         }
 
@@ -290,23 +279,6 @@ namespace SmsWorkbench
 
         private static SettingFieldViewModel Find(IEnumerable<SettingFieldViewModel> fields, string key)
             => fields.First(field => string.Equals(field.Key, key, StringComparison.Ordinal));
-
-        private static string ResolvePhoneSource(IEnumerable<SettingFieldViewModel> fields)
-        {
-            // 5sim is the desktop default; keep SMSBower only when 5sim is unset.
-            if (HasPhoneVendorKey(Find(fields, "5sim_api_key").Value, "5SIM_API_KEY"))
-                return "5sim";
-            return "smsbower";
-        }
-
-        private static bool HasPhoneVendorKey(string value, string envName)
-        {
-            string text = (value ?? "").Trim();
-            if (text.Length == 0) return false;
-            if (text == "$" + envName || text == "YOUR_" + envName)
-                return !string.IsNullOrWhiteSpace(Environment.GetEnvironmentVariable(envName));
-            return true;
-        }
 
         private static string[] ParseList(string value)
             => (value ?? "")
@@ -333,7 +305,7 @@ namespace SmsWorkbench
             IEnumerable<string> entries = value is JsonArray array
                 ? array.Select(item => item?.ToString() ?? "")
                 : ParseList(value?.ToString() ?? "");
-            return string.Join(Environment.NewLine, entries.Where(item => item.Length > 0));
+            return string.Join(ProxyInputNormalizer.LineSeparator, entries.Where(item => item.Length > 0));
         }
 
         private static string FirstArray(JsonObject root, string path)

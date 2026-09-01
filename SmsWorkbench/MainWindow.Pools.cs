@@ -14,8 +14,7 @@ namespace SmsWorkbench
             string scope = DisplayText(ScopeFilter);
             string term = (SearchText ?? "").Trim().ToLowerInvariant();
 
-            if (scope == "邮箱池" && !IsMailboxPoolLikeRow(row)) return false;
-            if (scope == "已注册" && !IsRegisteredRow(row)) return false;
+            if (scope == "有试用" && !PromotionStatusPresentation.IsTrialEligible(row.PromotionStatus)) return false;
             if (scope == "待处理" && !row.Status.Contains("待") && !row.Status.Contains("缺") && !row.Status.Contains("失败")) return false;
             if (term.Length == 0) return true;
 
@@ -29,18 +28,16 @@ namespace SmsWorkbench
             return MailboxPoolFileStore.IsMailboxPoolLike(row.AccountType, row.MailboxProvider);
         }
 
-        private bool poolsRefreshRunning;
-
         /// <summary>
         /// Fire-and-forget refresh entry kept for existing sync callers; the
         /// actual work is async so the UI thread never waits on a backend call.
         /// </summary>
         private void RefreshPools()
         {
-            _ = RefreshPoolsAsync();
+            _ = RefreshPoolsAsync(_lifetimeCts.Token);
         }
 
-        private async Task RefreshPoolsAsync()
+        private async Task RefreshPoolsAsync(CancellationToken ct = default)
         {
             if (poolsRefreshRunning)
                 return;
@@ -102,20 +99,13 @@ namespace SmsWorkbench
 
         private void UpdateOverview()
         {
-            int phoneVerified = allRows.Count(IsPhoneVerifiedRow);
+            int trialEligible = allRows.Count(r => PromotionStatusPresentation.IsTrialEligible(r.PromotionStatus));
             int registered = allRows.Count(IsRegisteredRow);
-            int paypal = allRows.Count(IsPayPalCompletedRow);
             int attention = allRows.Count(r => r.Status.Contains("待") || r.Status.Contains("缺") || r.Status.Contains("失败"));
             TotalCountText = allRows.Count.ToString();
-            MailboxCountText = phoneVerified.ToString();
+            TrialCountText = trialEligible.ToString();
             RegisteredCountText = registered.ToString();
-            PaypalCountText = paypal.ToString();
             AttentionCountText = attention.ToString();
-        }
-
-        private bool IsPhoneVerifiedRow(PoolRow row)
-        {
-            return !string.IsNullOrWhiteSpace(row.Phone);
         }
 
         private bool IsRegisteredRow(PoolRow row)
@@ -124,14 +114,6 @@ namespace SmsWorkbench
                 || row.SourcePath.EndsWith(".sqlite3", StringComparison.OrdinalIgnoreCase)
                 || row.Status.Contains("已注册")
                 || row.Status.Contains("PayPal");
-        }
-
-        private bool IsPayPalCompletedRow(PoolRow row)
-        {
-            string status = (row.Status + " " + row.PayPalStatus).Trim();
-            return status.Contains("支付完成")
-                || status.Contains("Payment completed")
-                || row.PayPalStatus.Equals("completed", StringComparison.OrdinalIgnoreCase);
         }
 
         private bool IsImportableAccountRow(PoolRow row)
@@ -186,7 +168,7 @@ namespace SmsWorkbench
             return MailboxPoolFileStore.NormalizeEmailKey(email);
         }
 
-        private async Task LoadMailboxPoolAsync()
+        private async Task LoadMailboxPoolAsync(CancellationToken ct = default)
         {
             if (System.ComponentModel.DesignerProperties.GetIsInDesignMode(this)) return;
             try
@@ -310,7 +292,7 @@ namespace SmsWorkbench
             return "";
         }
 
-        private async Task LoadSessionPoolAsync()
+        private async Task LoadSessionPoolAsync(CancellationToken ct = default)
         {
             if (System.ComponentModel.DesignerProperties.GetIsInDesignMode(this)) return;
             try

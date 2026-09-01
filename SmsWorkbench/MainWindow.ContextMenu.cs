@@ -56,9 +56,9 @@ namespace SmsWorkbench
         }
 
         private void CtxCopyAccessToken_Click(object sender, RoutedEventArgs e)
-            => RunUiTask(CtxCopyAccessTokenAsync);
+            => RunUiTask(() => CtxCopyAccessTokenAsync());
 
-        private async Task CtxCopyAccessTokenAsync()
+        private async Task CtxCopyAccessTokenAsync(CancellationToken ct = default)
         {
             if (AccountGrid?.SelectedItem is not PoolRow row)
             {
@@ -112,16 +112,10 @@ namespace SmsWorkbench
                 OpenAccountJson(row);
         }
 
-        private void CtxMarkPayPal_Click(object sender, RoutedEventArgs e)
-        {
-            if (AccountGrid?.SelectedItem is PoolRow row)
-                MarkPayPalComplete(row);
-        }
-
         private void CtxCheckAccountAlive_Click(object sender, RoutedEventArgs e)
-            => RunUiTask(CtxCheckAccountAliveAsync);
+            => RunUiTask(() => CtxCheckAccountAliveAsync());
 
-        private async Task CtxCheckAccountAliveAsync()
+        private async Task CtxCheckAccountAliveAsync(CancellationToken ct = default)
         {
             if (AccountGrid?.SelectedItem is not PoolRow row || string.IsNullOrWhiteSpace(row.Identifier))
             {
@@ -136,7 +130,53 @@ namespace SmsWorkbench
             BatchProtocolPayment_Click(sender, e);
         }
 
-        private async Task CheckAccountAliveAsync(PoolRow row)
+        private void CtxChangeEmail_Click(object sender, RoutedEventArgs e)
+            => RunUiTask(() => CtxChangeEmailAsync());
+
+        private void ChangeEmail_Click(object sender, RoutedEventArgs e)
+            => RunUiTask(() => CtxChangeEmailAsync());
+
+        private async Task CtxChangeEmailAsync(CancellationToken ct = default)
+        {
+            var rows = SelectedRowsOrCurrent().Where(row => row != null && !string.IsNullOrWhiteSpace(row.Identifier)).ToList();
+            if (rows.Count == 0)
+            {
+                NotifyWarning("请先选择要换绑的账号。");
+                return;
+            }
+            var options = ChangeEmailDialogService.Show(
+                this,
+                rows.Count,
+                DefaultWorkerCount(),
+                GetConfiguredSmailrDomain(),
+                GetConfiguredCfWorkerDomain());
+            if (options is null) return;
+            var plan = BackendCommandPlanner.CreateChangeEmail(
+                rows.Select(row => row.Identifier).Distinct(StringComparer.OrdinalIgnoreCase).ToList(),
+                options.Provider,
+                options.MailboxFile,
+                options.Workers,
+                options.SmailrDomain,
+                options.CfworkerDomain,
+                GetRegistrationProxyPool(),
+                rootDir);
+            string json;
+            try { json = await RunBackendWithResultAsync(plan.TaskName, plan.Arguments.ToList(), plan.TimeoutMilliseconds ?? 900000); }
+            finally { foreach (string path in plan.TempFiles) TryDeleteFile(path); }
+            try
+            {
+                using var doc = JsonDocument.Parse(json);
+                bool ok = doc.RootElement.TryGetProperty("ok", out var okEl) && okEl.GetBoolean();
+                await DialogFactory.ShowInfoAsync(this, "邮箱换绑", ok ? "邮箱换绑完成。" : "邮箱换绑部分失败，请查看任务结果。 ");
+                RefreshPools();
+            }
+            catch
+            {
+                await DialogFactory.ShowInfoAsync(this, "邮箱换绑", "未收到有效结果，请查看运行日志。");
+            }
+        }
+
+        private async Task CheckAccountAliveAsync(PoolRow row, CancellationToken ct = default)
         {
             if (row == null || string.IsNullOrWhiteSpace(row.Identifier))
             {

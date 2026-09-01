@@ -4,6 +4,7 @@ from types import SimpleNamespace
 from unittest.mock import patch
 
 from sms_tool import cli, registration, registration_preflight, sentinel_tokens
+from sms_tool.config import ConfigError
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -86,6 +87,29 @@ def test_cli_preflights_before_claiming_mailbox_and_promotes_healthy_proxy():
     assert calls == ["http://first.example:8080", "http://second.example:8080"]
     assert args.proxy == "http://second.example:8080"
     assert args.proxy_pool.splitlines()[0] == "http://second.example:8080"
+
+
+def test_cli_rejects_missing_browser_driver_credentials_before_network_preflight():
+    args = SimpleNamespace(
+        registration_driver="roxy",
+        proxy="http://registration.example:8080",
+        proxy_explicit=False,
+        proxy_pool="",
+    )
+    config = {
+        "registration": {"driver": "roxy", "drivers": {"roxy": {}}},
+        "proxy": {"registration": "http://registration.example:8080"},
+    }
+    with patch.object(cli, "CFG", config), patch(
+        "sms_tool.registration.registration_network_preflight"
+    ) as network_preflight:
+        try:
+            cli._preflight_registration_before_mailbox(args)
+        except ConfigError as exc:
+            assert str(exc) == "roxy_workspace_id_missing"
+        else:
+            raise AssertionError("missing Roxy credentials should fail preflight")
+    network_preflight.assert_not_called()
 
 
 def test_registration_normalizes_provider_proxy_before_sentinel_extraction():

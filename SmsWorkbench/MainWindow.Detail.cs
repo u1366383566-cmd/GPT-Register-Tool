@@ -4,9 +4,9 @@ namespace SmsWorkbench
     {
         // Account detail dialog and detail formatting
         private void ShowAccountDetail(PoolRow row)
-            => RunUiTask(() => ShowAccountDetailAsync(row));
+            => RunUiTask(() => ShowAccountDetailAsync(row, _lifetimeCts.Token));
 
-        private async Task ShowAccountDetailAsync(PoolRow row)
+        private async Task ShowAccountDetailAsync(PoolRow row, CancellationToken ct = default)
         {
             if (row == null) return;
             string detail = await BuildAccountDetailAsync(row);
@@ -226,17 +226,10 @@ namespace SmsWorkbench
             openPayPalButton.Click += (_, __) => OpenPayPalUrl(paypalUrl, row.Identifier);
             var copyPayPalButton = new Button { Content = "复制支付链接", MinWidth = 120, IsEnabled = hasPayPal, Margin = new Thickness(0, 0, 8, 0) };
             copyPayPalButton.Click += (_, __) => CopyPayPalUrl(paypalUrl, row.Identifier);
-            var markPayPalCompleteButton = new Button { Content = "标记支付完成", MinWidth = 120, Style = (System.Windows.Style)FindResource("PrimaryButton"), Margin = new Thickness(0, 0, 8, 0) };
-            markPayPalCompleteButton.Click += (_, __) =>
-            {
-                MarkPayPalComplete(row);
-                dialog.Close();
-            };
             var closeButton = new Button { Content = "关闭", MinWidth = 80 };
             closeButton.Click += (_, __) => dialog.Close();
             rightActions.Children.Add(openPayPalButton);
             rightActions.Children.Add(copyPayPalButton);
-            rightActions.Children.Add(markPayPalCompleteButton);
             rightActions.Children.Add(closeButton);
 
             Grid.SetColumn(leftActions, 0);
@@ -250,7 +243,7 @@ namespace SmsWorkbench
             dialog.ShowDialog();
         }
 
-        private async Task<string> ResolveAccountAccessTokenAsync(PoolRow row)
+        private async Task<string> ResolveAccountAccessTokenAsync(PoolRow row, CancellationToken ct = default)
         {
             var data = new Dictionary<string, object>(StringComparer.OrdinalIgnoreCase);
             if (!await TryLoadAccountDataForRowAsync(row, data) || data.Count == 0)
@@ -268,9 +261,9 @@ namespace SmsWorkbench
         }
 
         private void OpenAccountJson(PoolRow row)
-            => RunUiTask(() => OpenAccountJsonAsync(row));
+            => RunUiTask(() => OpenAccountJsonAsync(row, _lifetimeCts.Token));
 
-        private async Task OpenAccountJsonAsync(PoolRow row)
+        private async Task OpenAccountJsonAsync(PoolRow row, CancellationToken ct = default)
         {
             string path = await ResolveAccountJsonPathAsync(row);
             if (string.IsNullOrWhiteSpace(path))
@@ -281,7 +274,7 @@ namespace SmsWorkbench
             OpenPath(path);
         }
 
-        private async Task<string> ResolveAccountJsonPathAsync(PoolRow row)
+        private async Task<string> ResolveAccountJsonPathAsync(PoolRow row, CancellationToken ct = default)
         {
             if (row == null) return "";
             string notes = (row.Notes ?? "").Trim();
@@ -361,7 +354,7 @@ namespace SmsWorkbench
             parent.Children.Add(valueBox);
         }
 
-        private async Task<string> BuildAccountDetailAsync(PoolRow row)
+        private async Task<string> BuildAccountDetailAsync(PoolRow row, CancellationToken ct = default)
         {
             var lines = new List<string>
             {

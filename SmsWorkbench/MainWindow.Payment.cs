@@ -25,46 +25,6 @@ namespace SmsWorkbench
             OpenPayPalUrl(row.PayPalUrl, row.Identifier);
         }
 
-        private void MarkPayPalComplete_Click(object sender, RoutedEventArgs e)
-        {
-            var rows = SelectedEmailRowsOrNotify("标记支付完成");
-            if (rows.Count == 0) return;
-            MarkPayPalComplete(rows);
-        }
-
-        private void MarkPayPalComplete(PoolRow row)
-        {
-            MarkPayPalComplete(row == null ? new List<PoolRow>() : new List<PoolRow> { row });
-        }
-
-        private void MarkPayPalComplete(List<PoolRow> rows)
-        {
-            rows = (rows ?? new List<PoolRow>())
-                .Where(r => !string.IsNullOrWhiteSpace(r.Identifier))
-                .GroupBy(r => r.Identifier.Trim().ToLowerInvariant())
-                .Select(g => g.First())
-                .ToList();
-            if (rows.Count == 0)
-            {
-                ShowEmailSelectionRequired("标记支付完成");
-                return;
-            }
-
-            if (rows.Count == 1)
-            {
-                PoolRow row = rows[0];
-                var plan = BackendCommandPlanner.CreateMarkPaymentComplete(
-                    row.Identifier,
-                    SessionFileFor(row));
-                RunBackend(plan.TaskName, plan.Arguments.ToList());
-                return;
-            }
-
-            var batchPlan = BackendCommandPlanner.CreateMarkPaymentCompleteBatch(
-                rows.Select(r => r.Identifier.Trim()).ToList());
-            RunBackend(batchPlan.TaskName, batchPlan.Arguments.ToList());
-        }
-
         private void AtExtractBaLink_Click(object sender, RoutedEventArgs e)
         {
             var selected = SelectedRowsOrCurrent()
@@ -83,6 +43,20 @@ namespace SmsWorkbench
         /// </summary>
         private void ShowProtocolPaymentDialog(PoolRow selectedAccount = null)
         {
+            // Same single-backend-task guard as the batch dialog: the coordinator
+            // rejects a concurrent run, so surface it here instead of failing
+            // once the dialog's run begins.
+            if (backendTasks.IsRunning)
+            {
+                MessageBox.Show(
+                    this,
+                    "已有后端任务正在运行，请先等待其完成或取消后再发起协议支付。",
+                    "任务进行中",
+                    MessageBoxButton.OK,
+                    MessageBoxImage.Information);
+                return;
+            }
+
             ProtocolPaymentAccount account = selectedAccount == null
                 ? null
                 : new ProtocolPaymentAccount(selectedAccount.Identifier, SessionFileFor(selectedAccount));

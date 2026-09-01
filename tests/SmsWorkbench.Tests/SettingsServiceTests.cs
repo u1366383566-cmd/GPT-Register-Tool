@@ -42,7 +42,7 @@ public sealed class SettingsServiceTests
         SettingsSaveResult result = service.Save(categories);
 
         Assert.True(result.Ok, result.Error);
-        JsonObject root = JsonNode.Parse(File.ReadAllText(configPath, Encoding.UTF8))!.AsObject();
+        JsonObject root = ConfigTestHelpers.ReadMergedConfig(fixture.Path);
         Assert.Equal(42, root["unknown_extension"]!["keep"]!.GetValue<int>());
         Assert.Equal("http://primary", root["proxy"]!["registration"]!.GetValue<string>());
         Assert.Equal("http://primary", root["proxy"]!["default"]!.GetValue<string>());
@@ -89,6 +89,67 @@ public sealed class SettingsServiceTests
     }
 
     [Fact]
+    public void CatalogExposesIndependentBrowserRegistrationDriversAndSecrets()
+    {
+        SettingDefinition driver = SettingsCatalog.AllFields.Single(field => field.Key == "registration_driver");
+        Assert.Equal(SettingFieldKind.Options, driver.Kind);
+        Assert.Equal(
+            new[] { "protocol", "playwright", "roxy", "cloak", "camoufox", "adspower" },
+            driver.Options);
+
+        Assert.Equal(SettingFieldKind.Secret, SettingsCatalog.AllFields.Single(field => field.Key == "roxy_api_token").Kind);
+        Assert.Equal(SettingFieldKind.Secret, SettingsCatalog.AllFields.Single(field => field.Key == "cloak_license_key").Kind);
+        Assert.Contains(
+            SettingsCatalog.Categories.Single(category => category.Title == "注册与接码").Sections,
+            section => section.Title == "RoxyBrowser");
+    }
+
+    [Fact]
+    public void BrowserDriverSettingsLoadAndSaveRoundTrip()
+    {
+        using var fixture = new TemporaryDirectory();
+        string configPath = Path.Combine(fixture.Path, "config.json");
+        File.WriteAllText(configPath, """
+            {
+              "registration": {
+                "driver": "camoufox",
+                "browser_headless": false,
+                "browser_timeout_seconds": 75,
+                "browser_locale": "en-GB",
+                "browser_timezone": "Europe/London",
+                "drivers": {
+                  "roxy": { "api_token": "roxy-token", "workspace_id": "11" },
+                  "cloak": { "license_key": "cloak-key", "humanize": false },
+                  "camoufox": { "humanize": false, "max_width": 1366 }
+                }
+              }
+            }
+            """, new UTF8Encoding(false));
+        var service = new SettingsService(new TestApplicationPaths(fixture.Path));
+
+        IReadOnlyList<SettingsCategoryViewModel> categories = service.Load();
+
+        Assert.Equal("camoufox", Field(categories, "registration_driver").Value);
+        Assert.False(Field(categories, "registration_browser_headless").BooleanValue);
+        Assert.Equal("roxy-token", Field(categories, "roxy_api_token").Value);
+        Assert.Equal("cloak-key", Field(categories, "cloak_license_key").Value);
+        Assert.False(Field(categories, "camoufox_humanize").BooleanValue);
+
+        Field(categories, "registration_driver").Value = "roxy";
+        Field(categories, "registration_browser_headless").BooleanValue = true;
+        Field(categories, "roxy_workspace_id").Value = "22";
+        Field(categories, "camoufox_max_width").Value = "1440";
+        SettingsSaveResult result = service.Save(categories);
+
+        Assert.True(result.Ok, result.Error);
+        JsonObject root = ConfigTestHelpers.ReadMergedConfig(fixture.Path);
+        Assert.Equal("roxy", root["registration"]!["driver"]!.GetValue<string>());
+        Assert.True(root["registration"]!["browser_headless"]!.GetValue<bool>());
+        Assert.Equal("22", root["registration"]!["drivers"]!["roxy"]!["workspace_id"]!.GetValue<string>());
+        Assert.Equal(1440, root["registration"]!["drivers"]!["camoufox"]!["max_width"]!.GetValue<int>());
+    }
+
+    [Fact]
     public void LoadUsesSmailrEnvironmentKeyWhenConfigValueIsEmpty()
     {
         using var fixture = new TemporaryDirectory();
@@ -128,7 +189,7 @@ public sealed class SettingsServiceTests
         IReadOnlyList<SettingsCategoryViewModel> categories = service.Load();
 
         Assert.Equal(
-            string.Join(Environment.NewLine, "http://registration-one", "http://registration-two"),
+            string.Join("\n", "http://registration-one", "http://registration-two"),
             Field(categories, "registration_proxy_pool").Value);
         Assert.DoesNotContain(SettingsCatalog.AllFields, field => field.Key == "protocol_proxy_pool");
     }
@@ -168,7 +229,7 @@ public sealed class SettingsServiceTests
         SettingsSaveResult result = service.Save(categories);
 
         Assert.True(result.Ok, result.Error);
-        JsonObject root = JsonNode.Parse(File.ReadAllText(configPath, Encoding.UTF8))!.AsObject();
+        JsonObject root = ConfigTestHelpers.ReadMergedConfig(fixture.Path);
         Assert.Equal(
             "http://account_custom_zone_US:password@us.ipwo.net:7878",
             root["proxy"]!["registration"]!.GetValue<string>());
@@ -208,7 +269,7 @@ public sealed class SettingsServiceTests
         SettingsSaveResult result = service.Save(categories);
 
         Assert.True(result.Ok, result.Error);
-        JsonObject root = JsonNode.Parse(File.ReadAllText(configPath, Encoding.UTF8))!.AsObject();
+        JsonObject root = ConfigTestHelpers.ReadMergedConfig(fixture.Path);
         // Python already defaults these (smsbower.OPENAI_SERVICE_CODE / display-only
         // metadata), so Save must leave operator values untouched.
         Assert.Equal("custom", root["phone_reuse"]!["smsbower"]!["service"]!.GetValue<string>());
@@ -230,7 +291,7 @@ public sealed class SettingsServiceTests
         SettingsSaveResult result = service.Save(categories);
 
         Assert.True(result.Ok, result.Error);
-        JsonObject root = JsonNode.Parse(File.ReadAllText(configPath, Encoding.UTF8))!.AsObject();
+        JsonObject root = ConfigTestHelpers.ReadMergedConfig(fixture.Path);
         // The catalog fields create phone_reuse.smsbower, but the previously forced
         // business values must stay absent so Python-side defaults keep applying.
         Assert.Null(root["phone_reuse"]!["smsbower"]!["service"]);
@@ -297,7 +358,7 @@ public sealed class SettingsServiceTests
             smsBower.Remove("country_prefix");
         });
 
-        JsonObject root = JsonNode.Parse(File.ReadAllText(configPath, Encoding.UTF8))!.AsObject();
+        JsonObject root = ConfigTestHelpers.ReadMergedConfig(fixture.Path);
         Assert.Equal(42, root["unknown_extension"]!["keep"]!.GetValue<int>());
         Assert.Equal("22", root["phone_reuse"]!["smsbower"]!["country"]!.GetValue<string>());
         Assert.Null(root["phone_reuse"]!["smsbower"]!["country_prefix"]);
@@ -315,7 +376,7 @@ public sealed class SettingsServiceTests
 
         service.UpdateConfig(root => root["phone_reuse"] = new JsonObject { ["source"] = "smsbower" });
 
-        JsonObject root = JsonNode.Parse(File.ReadAllText(configPath, Encoding.UTF8))!.AsObject();
+        JsonObject root = ConfigTestHelpers.ReadMergedConfig(fixture.Path);
         Assert.Equal("smsbower", root["phone_reuse"]!["source"]!.GetValue<string>());
     }
 

@@ -55,7 +55,7 @@ GPT-Register-Tool 采用 **WPF 桌面端 + Python 业务核心**，提供邮箱 
 | 数据存储 | JSON、JSONL、SQLite |
 | 邮箱协议 | ReMail API、CFWorker、iCloud 接码链接、Microsoft Graph/OAuth、IMAP、Gmail IMAP |
 | 支付协议 | Stripe Checkout、PayPal、GoPay、GCash、GrabPay、UPI、iDEAL、PIX、Kakao Pay、BLIK、TWINT、直卡 Checkout、MoMo |
-| 浏览器辅助 | Playwright、Camoufox、CloakBrowser |
+| 浏览器辅助 | Playwright、Camoufox、CloakBrowser、RoxyBrowser、AdsPower |
 
 ## 安装部署方式
 
@@ -129,6 +129,18 @@ powershell -ExecutionPolicy Bypass -File .\SmsWorkbench\build_dotnet.ps1
 3. 按需配置 SMSBower、CPA、SUB2API 和各协议支付参数。
 4. 保存后重新打开对应功能即可使用新配置。
 
+注册驱动在 **设置 -> 注册与接码 -> 注册驱动** 中选择，默认仍为 `protocol`。选择浏览器驱动后，注册会复用同一套邮箱 OTP、Session 提取、AT HTTP 200 探活和本地持久化边界：
+
+- `playwright`：本机 Chromium，通过 Playwright 启动。
+- `roxy`：连接本机 RoxyBrowser API 创建/打开 Profile，再通过 CDP 接管。
+- `cloak`：调用已安装的 CloakBrowser Python SDK。
+- `camoufox`：调用已安装的 Camoufox 反检测浏览器（**当前默认浏览器驱动**）。
+- `adspower`：连接本机 AdsPower API 创建/打开环境，再通过 CDP 接管。
+
+RoxyBrowser 与 AdsPower 的 API/会话配置位于同一设置页的独立分区；CloakBrowser 的 License Key、持久化目录和指纹参数也在那里配置。未配置所选驱动的必需字段时，任务会返回脱敏的配置错误，不会回退到协议注册。浏览器驱动不绕过 CAPTCHA；遇到人工挑战会以 `manual_challenge_required` 结束，保留现有账号状态。
+
+浏览器注册默认启用 **脉冲调度**（`registration.pulse`，波次间隔 + OTP-ban 暂停）与 **浏览器进程池**（`registration.browser_process_pool`，按进程复用浏览器上下文、按健康度回收）。二者与「账号 ↔ 代理槽绑定」协同：每个账号在整个生命周期内固定走同一个注册出口，重试时只刷新会话 sid，不切换代理成员——避免出口轮换被注册方判定为代理抖动而封禁。进程池哈希键按 `(driver, headless, timeout)` 缓存，使同一出口、同一头部配置的账号复用同一浏览器进程，降低冷启动开销。
+
 ReMail API Key 也可以通过环境变量提供：
 
 ```powershell
@@ -199,7 +211,7 @@ OTP 解析支持主题匹配、发件人过滤、收件人精确匹配、服务�
 
 ### 协议支付提链
 
-- 支持 PayPal、GoPay、GCash、GrabPay、UPI、iDEAL、PIX、Kakao Pay、BLIK、TWINT、直卡 Checkout、MoMo。
+- 支持 PayPal、GoPay、GCash、GrabPay、UPI、iDEAL、PIX、Kakao Pay、BLIK、TWINT、直卡 Checkout、MoMo、QRIS、Bizum、Naver Pay（共 15 种；QRIS/Bizum/Naver Pay 为 canary，未开放注册入口，仅 CLI 可选）。
 - BLIK 会提交一次性六位码并直接执行支付，只在单账号协议支付弹窗/命令中提供，不进入注册后自动提链或批量支付选择器。
 - 直卡 Checkout（菲律宾 PH/PHP）：走 US 下单 → TR 刷优惠 → 校验 0 元，产出 `chatgpt.com/checkout/<entity>/<cs_id>` 直卡结账长链。
 - MoMo（越南 VN/VND）：下单 → Stripe init → 强制 ₫0 → 建 MoMo PM → Confirm → Approve → 跟跳转，产出可扫的 `payment.momo.vn` 二维码（自动解码为 PNG，供“打开二维码”使用）。
@@ -209,7 +221,7 @@ OTP 解析支持主题匹配、发件人过滤、收件人精确匹配、服务�
 - PayPal BA 提取成功后可进入持久化后续授权队列；该队列只属于 PayPal，不在其他支付方式界面显示。
 - PayPal 回跳对账由独立 `paypal_reconciliation.py` 处理，只跟踪白名单内的 Stripe Return → OpenAI Pay → Checkout Verify，并输出脱敏的 `conclusive`/`unknown`/`failed` 证据；它不改变提链接口，也不生成或覆盖支付链接。
 - 批量协议支付使用两个相互独立的支付出口池：Checkout 池默认跟随账单区，Approve / Update 与 Checkout 共用完整账单地区目录，不再限制为 JP/TR；Promotion、Provider、Confirm 和 Redirect 继续使用各适配器的内部阶段国家契约。
-- 动态代理会按支付方法自动改写国家与 Session，支持 US、JP、VN、ID、IN、NL、BR、KR、PL、CH、PH 等目标出口。
+- 动态代理会按支付方法自动改写国家与 Session，支持 `payment_methods.json` 中 `checkout_countries` 列出的 13 个目标出口：US、ID、JP、TR、TH、VN、PH、IN、GB、DE、ES、KR、BR（以配置文件为准，不要照抄旧文档的 NL/PL/CH——那三者不在结账国列表里，配不出结果）。
 - 协议支付代理池按顺序探测，当前代理不可用或出口国家不匹配时自动切换下一条。
 - 地区和代理选择保存为历史记录。
 - 支持实际测试代理出口 IP、国家及预期地区是否匹配。
@@ -255,8 +267,7 @@ OTP 解析支持主题匹配、发件人过滤、收件人精确匹配、服务�
 
 ### 手机接码
 
-- 支持 SMSBower 与 5sim.net 两种接码服务商（默认 5sim，可在设置/一键接码中选择）。
-- 5sim 使用 `https://5sim.net/v1` API，凭据为 5sim 用户中心的 Bearer Token（`phone_reuse.5sim.api_key` 或环境变量 `5SIM_API_KEY`），支持国家/运营商/产品三级选择。
+- 支持 SMSBower 国家与价格档位查询。
 - 支持发送重试、等待超时和轮询间隔配置。
 - 支持 Codex OAuth 手机验证和账号刷新流程。
 - 批量操作保持邮箱与手机号结果映射，便于排查单账号失败。
@@ -374,6 +385,20 @@ services/
 
 ## 核心配置
 
+### 配置分片（config sharding）
+
+`config.json` 在 08-30 的改造中拆成了 **3 个分片文件**，全部被 Git 忽略、只存本地：
+
+| 分片文件 | 归属的顶层键（共 22 个） |
+|---|---|
+| `proxy.json` | `proxy`、`mailbox_proxy`、`phone_reuse`、`paypal_browser` |
+| `runtime.json` | `runtime`、`timeouts`、`storage`、`output`、`account_health`、`registration`、`chatgpt`、`email_registration`、`codex_oauth` |
+| `payment.json` | `paypal`、`paypal_nocard`、`upi`、`omakse`、`protocol_payments`、`kakao`、`momo`、`cpa_mode`、`sub2api` |
+
+写入时按 `SHARD_OWNERSHIP`（`sms_tool/config.py`）路由到正确的分片；未列出的键默认进 `runtime.json`。
+**配置模板是 `config.example.json`**（入库、安全），三个分片文件**不要**提交到仓库（含代理口令 / API Key / 支付凭据）。
+桌面「设置」页保存、CLI 启动都会先合并这三个分片再使用，分片缺失会自动从 `config.example.json` 派生默认值。
+
 ### ReMail
 
 ```json
@@ -482,6 +507,8 @@ HTTP 401 的支付账号按 OAuth Refresh Token、现有 Cookie `/api/auth/sessi
 
 - `PP_STRIPE_PUBLISHABLE_KEY`：统一覆盖协议支付回退用的 Stripe publishable key（`sms_tool/gen_pp_link.py` 与 `services/protocol-payment/momo/ac_paylink_core.py` 两处共用）。checkout 响应通常自带该 key，仅在响应缺失时用到回退值；回退时会打印 WARN 日志。
 - `OPENAI_SENTINEL_VERSION`：覆盖 Sentinel SDK 版本（默认值内置于 `sms_tool/sentinel_quickjs.py`）。SDK 下载返回 403/404 通常表示当前版本已被轮换失效，更新此变量或 config 的 `sentinel_version` 即可。
+- `OPENAI_SENTINEL_DISABLE_QUICKJS`：设任意值可显式禁用真实 SDK 路径；生产注册默认不建议设置，
+  因为纯 HTTP PoW 无法通过 Sentinel 深层校验。
 
 启动前可运行 `python scripts/preflight_env.py` 检出 Node.js、Playwright Chromium 与关键 Python 包是否就绪。
 
@@ -625,7 +652,7 @@ powershell -ExecutionPolicy Bypass -File .\scripts\build_installer.ps1 -Version 
 - [架构说明](docs/architecture.md)
 - [目录职责](docs/directory-map.md)
 - [PayPal 0 元链接说明](docs/paypal-zero-due-link.md)
-- [最新发布说明](docs/release-v2026.08.20.md)
+- [最新发布说明](docs/release-v2026.08.22.md)
 - [代理指南](PROXY_GUIDE.md)
 
 ## 许可证与使用责任

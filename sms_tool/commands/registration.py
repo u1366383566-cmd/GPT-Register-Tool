@@ -19,6 +19,7 @@ from pathlib import Path
 from typing import Any
 
 from .helpers import unique_emails
+from ..payment_operation import PaymentOperationConflict, PaymentOperationStore
 
 
 @dataclass(frozen=True)
@@ -42,9 +43,25 @@ class RegistrationCommandContext:
 
 def preflight_registration_before_mailbox(args: Any, ctx: RegistrationCommandContext) -> dict:
     """Select a healthy auth route before a paid/disposable mailbox is claimed."""
-    from ..registration import registration_network_preflight
+    from ..config import validate_registration_driver_config
 
     candidates = ctx.proxy_pool_values(args) or [None]
+    selected_proxy = next(
+        (str(candidate).strip() for candidate in candidates if str(candidate or "").strip()),
+        None,
+    )
+    # Keep this before proxy/network checks and mailbox loading.  Browser
+    # credentials and cloud-provider proxy ownership are static configuration;
+    # a mismatch must not consume a paid mailbox or validate an unrelated route.
+    selected_driver = validate_registration_driver_config(
+        ctx.runtime_config,
+        getattr(args, "registration_driver", None),
+        proxy=selected_proxy,
+    )
+    # Every remaining driver launches its browser locally, so a Sentinel/
+    # ChatGPT probe from this process measures the real registration egress.
+    from ..registration import registration_network_preflight
+
     last_error = None
     for candidate in candidates:
         try:
@@ -173,6 +190,84 @@ def persist_registration_result(
     *,
     pipeline_timing=None,
 ):
+    """Persist one completed registration result behind a cross-process durable
+    idempotency boundary.
+
+    The in-memory ``_PERSISTENCE_KEY`` marker (in ``_persist_registration_result_core``)
+    keeps retries idempotent *within* a process. This wrapper adds the durable layer:
+    a ``PaymentOperationStore`` record keyed by ``email|batch`` acquires a cross-process
+    lock and replays the same guard used for payments, so two processes (or a restart
+    mid-batch) cannot double-write the session file, upsert the row, or re-enqueue the
+    health check. A successful persist is finalized (replays blocked); a failed one is
+    left running so the in-process finalization retry can still re-acquire the lock.
+    """
+    identity = (data.get("email") or data.get("phone") or "unknown") if isinstance(data, dict) else "unknown"
+    batch_id = str(getattr(args, "registration_batch_id", "") or "")
+    # Cheap in-process guard: this exact result object was already persisted in this
+    # process (save_registration_results re-emits the same data objects). The durable
+    # journal below is only for cross-process / restart dedup, so skip it here.
+    marker = data.get(_PERSISTENCE_KEY) if isinstance(data, dict) else None
+    if isinstance(marker, dict) and marker.get("status") == "complete":
+        return marker
+
+    store = PaymentOperationStore.from_config(ctx.runtime_config)
+    try:
+        op = store.begin(
+            payment_method="registration",
+            operation="persist_result",
+            idempotency_key=f"{identity}|{batch_id}",
+        )
+    except PaymentOperationConflict as conflict:
+        previous = conflict.record
+        return {
+            "status": "complete",
+            "session_saved": int(previous.get("session_saved") or 0),
+            "db_saved": int(previous.get("db_saved") or 0),
+            "import_email": str(data.get("email") or "") if isinstance(data, dict) else "",
+            "durable_conflict": True,
+        }
+
+    try:
+        result = _persist_registration_result_core(args, data, base_dir, ctx, pipeline_timing=pipeline_timing)
+    except Exception as exc:
+        # A persistence failure (e.g. a temporary DB error) must surface as a failed
+        # status, not propagate. Leave the durable record running so an in-process
+        # retry can re-acquire the lock and attempt the side effects again.
+        op.close()
+        return {
+            "status": "failed",
+            "session_saved": 0,
+            "db_saved": 0,
+            "import_email": str(data.get("email") or "") if isinstance(data, dict) else "",
+            "error": str(exc)[:500],
+        }
+
+    # Finalize only when the core durably persisted the account row (db_saved == 1).
+    # A logical failure (success=False) leaves db_saved 0 and must not be finalized, and
+    # an upsert error leaves db_saved 0 even if the session file was written; in both cases
+    # leave the durable record running so an in-process / cross-process retry can re-acquire
+    # the lock and attempt the side effects again.
+    committed = isinstance(result, dict) and bool(result.get("db_saved"))
+    if committed:
+        # Carry the real side-effect counts onto the journal record so a later
+        # durable-conflict replay (e.g. save_registration_results re-persisting the
+        # same account, or a cross-process resume) reports accurate totals instead of 0.
+        op.record["session_saved"] = int(result.get("session_saved") or 0)
+        op.record["db_saved"] = int(result.get("db_saved") or 0)
+        op.finish({"ok": True, "status": "completed", "side_effect_started": True})
+    else:
+        op.close()
+    return result
+
+
+def _persist_registration_result_core(
+    args,
+    data,
+    base_dir,
+    ctx: RegistrationCommandContext,
+    *,
+    pipeline_timing=None,
+):
     """Persist one completed registration result and make retries idempotent."""
     from ..storage import record_registration_audit
 
@@ -283,6 +378,24 @@ def persist_registration_result(
         if not marker.get("db_completed"):
             marker["db_saved"] = 1 if ctx.upsert_account(session_data, json_path=out_path) else 0
             marker["db_completed"] = True
+        if marker.get("db_saved") and not marker.get("account_health_enqueued"):
+            try:
+                from ..account_health_queue import enqueue_post_registration_checks
+
+                health_jobs = enqueue_post_registration_checks(
+                    session_data,
+                    source="registration",
+                    config=ctx.runtime_config,
+                )
+                marker["account_health_jobs"] = [
+                    str(item.get("id") or "") for item in health_jobs if item.get("id")
+                ]
+                marker["account_health_enqueued"] = True
+            except Exception as exc:
+                print(
+                    "[!] Post-registration health queue warning: "
+                    f"{type(exc).__name__}"
+                )
         if not marker.get("active_audited"):
             record_registration_audit(
                 data,
@@ -361,7 +474,10 @@ def save_registration_results(
         promotion_report = ctx.check_registered_promotions(
             import_emails,
             workers=max(1, int(getattr(args, "workers", 4) or 4)),
-            proxy=getattr(args, "proxy", None),
+            # Post-registration promotion checks use the account-health lane.
+            # Passing the signup proxy here defeats that isolation and can
+            # immediately re-use a contaminated registration exit.
+            proxy=None,
             timeout=max(5, int(getattr(args, "refresh_timeout", 20) or 20)),
         )
 
@@ -437,6 +553,8 @@ def run_target_at200(args, base_dir, ctx: RegistrationCommandContext):
                 phone_pool=phone_pool,
                 codex_oauth=False,
                 registration_mode=args.registration_mode,
+                registration_driver=getattr(args, "registration_driver", None),
+                browser_headless=getattr(args, "browser_headless", None),
                 enroll_2fa=not getattr(args, "no_2fa", False),
                 run_email_func=ctx.run_email,
                 on_result=persist_completed_result,
@@ -490,6 +608,9 @@ def run_target_at200(args, base_dir, ctx: RegistrationCommandContext):
     report_path.parent.mkdir(parents=True, exist_ok=True)
     report_path.write_text(json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8")
     report["report_path"] = str(report_path)
-    print(json.dumps(report, ensure_ascii=False, indent=2))
+    from ..desktop_ipc import emit_result
+
+    emit_result(report, enabled=bool(getattr(args, "desktop_ipc", False)))
     if not report["ok"]:
         raise SystemExit(3)
+    return report

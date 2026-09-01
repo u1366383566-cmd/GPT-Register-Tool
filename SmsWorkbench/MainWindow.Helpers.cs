@@ -5,7 +5,7 @@ namespace SmsWorkbench
         private void RunUiTask(Func<Task> operation)
             => _ = RunUiTaskAsync(operation);
 
-        private async Task RunUiTaskAsync(Func<Task> operation)
+        private async Task RunUiTaskAsync(Func<Task> operation, CancellationToken ct = default)
         {
             try
             {
@@ -40,7 +40,7 @@ namespace SmsWorkbench
             if (pool.Count > 1)
             {
                 args.Add("--proxy-pool");
-                args.Add(string.Join(Environment.NewLine, pool));
+                args.Add(string.Join(ProxyInputNormalizer.LineSeparator, pool));
             }
         }
 
@@ -139,7 +139,7 @@ namespace SmsWorkbench
 
         private int PageSizeValue()
         {
-            return int.TryParse(PageSizeText, out int value) && value > 0 ? Math.Min(value, 500) : 25;
+            return int.TryParse(PageSizeText, out int value) && value > 0 ? Math.Min(value, 500) : 100;
         }
 
         private string GetSessionsDir()
@@ -301,9 +301,9 @@ namespace SmsWorkbench
         }
 
         private void OpenPayPalUrl(string url, string accountEmail = "")
-            => RunUiTask(() => OpenPayPalUrlAsync(url, accountEmail));
+            => RunUiTask(() => OpenPayPalUrlAsync(url, accountEmail, _lifetimeCts.Token));
 
-        private async Task OpenPayPalUrlAsync(string url, string accountEmail = "")
+        private async Task OpenPayPalUrlAsync(string url, string accountEmail = "", CancellationToken ct = default)
         {
             url = await ResolveBackendPaymentUrlAsync(url, accountEmail);
             if (!IsHttpUrl(url))
@@ -339,9 +339,9 @@ namespace SmsWorkbench
         }
 
         private void CopyPayPalUrl(string url, string accountEmail = "")
-            => RunUiTask(() => CopyPayPalUrlAsync(url, accountEmail));
+            => RunUiTask(() => CopyPayPalUrlAsync(url, accountEmail, _lifetimeCts.Token));
 
-        private async Task CopyPayPalUrlAsync(string url, string accountEmail = "")
+        private async Task CopyPayPalUrlAsync(string url, string accountEmail = "", CancellationToken ct = default)
         {
             url = await ResolveBackendPaymentUrlAsync(url, accountEmail);
             if (!IsHttpUrl(url))
@@ -360,7 +360,7 @@ namespace SmsWorkbench
             }
         }
 
-        private async Task<string> ResolveBackendPaymentUrlAsync(string url, string accountEmail)
+        private async Task<string> ResolveBackendPaymentUrlAsync(string url, string accountEmail, CancellationToken ct = default)
         {
             if (!string.Equals(url, "backend://payment-url", StringComparison.OrdinalIgnoreCase)) return url;
             try

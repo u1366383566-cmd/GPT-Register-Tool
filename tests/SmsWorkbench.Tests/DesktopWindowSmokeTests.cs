@@ -33,7 +33,24 @@ public sealed class DesktopWindowSmokeTests
         Assert.True(contentSite.ActualWidth > 0);
 
         comboBox.IsDropDownOpen = true;
-        FlushDispatcher();
+        Assert.True(
+            WaitForDispatcher(
+                () =>
+                {
+                    var popup = comboBox.Template.FindName("Popup", comboBox) as Popup;
+                    var border = popup?.Child as Border;
+                    if (border is null)
+                        return false;
+
+                    var scrollBars = FindVisualChildren<ScrollBar>(border).ToArray();
+                    var verticalBar = scrollBars.SingleOrDefault(scrollBar => scrollBar.Orientation == Orientation.Vertical);
+                    var horizontalBar = scrollBars.SingleOrDefault(scrollBar => scrollBar.Orientation == Orientation.Horizontal);
+                    return border.ActualWidth >= comboBox.ActualWidth
+                        && verticalBar?.ActualWidth > 0
+                        && horizontalBar?.ActualHeight > 0;
+                },
+                TimeSpan.FromSeconds(5)),
+            "ComboBox popup did not finish layout in time");
 
         var popup = Assert.IsType<Popup>(comboBox.Template.FindName("Popup", comboBox));
         var border = Assert.IsType<Border>(popup.Child);
@@ -176,6 +193,19 @@ public sealed class DesktopWindowSmokeTests
             Assert.True(contentBounds.Bottom <= horizontalBounds.Top + 0.5);
             Assert.True(contentBounds.Right <= verticalBounds.Left + 0.5);
         }
+
+        SettingsCategoryViewModel registrationCategory = viewModel.Categories.Single(category => category.Title == "注册与接码");
+        viewModel.SelectedCategory = registrationCategory;
+        settings.UpdateLayout();
+        var driverEditor = FindVisualChildren<ComboBox>(settings)
+            .Single(editor => editor.IsVisible
+                && editor.DataContext is SettingFieldViewModel field
+                && field.Key == "registration_driver");
+        // Keep in sync with SettingsCatalog's registration_driver options:
+        // protocol / playwright / roxy / cloak / camoufox / adspower.
+        Assert.Equal(6, driverEditor.Items.Count);
+        Assert.True(contentScrollViewer.ScrollableHeight > 0);
+        Assert.Equal(Visibility.Visible, outerVerticalBar.Visibility);
     }
 
     private static Rect BoundsRelativeTo(FrameworkElement element, Visual ancestor)
@@ -197,7 +227,7 @@ public sealed class DesktopWindowSmokeTests
             new BackendTaskCoordinator(backendClient),
             new DesktopReadClient(new BackendTaskCoordinator(backendClient)),
             new WindowPaymentBatchDialogService(),
-            new PaymentBatchService(new TestApplicationPaths(rootDirectory), backendClient),
+            new PaymentBatchService(new TestApplicationPaths(rootDirectory), new BackendTaskCoordinator(backendClient)),
             new Wpf.Ui.SnackbarService(),
             new WindowSettingsDialogService(),
             new SettingsService(new TestApplicationPaths(rootDirectory)),
@@ -207,6 +237,23 @@ public sealed class DesktopWindowSmokeTests
             stage("show main window");
             main.Show();
             main.UpdateLayout();
+            var brandTitle = Assert.IsType<TextBlock>(main.FindName("SidebarBrandTitle"));
+            Assert.Equal("GPT Register Tool", brandTitle.Text);
+            var formattedBrandTitle = new FormattedText(
+                brandTitle.Text,
+                System.Globalization.CultureInfo.CurrentUICulture,
+                brandTitle.FlowDirection,
+                new Typeface(
+                    brandTitle.FontFamily,
+                    brandTitle.FontStyle,
+                    brandTitle.FontWeight,
+                    brandTitle.FontStretch),
+                brandTitle.FontSize,
+                brandTitle.Foreground,
+                VisualTreeHelper.GetDpi(brandTitle).PixelsPerDip);
+            Assert.True(
+                formattedBrandTitle.WidthIncludingTrailingWhitespace <= brandTitle.ActualWidth + 0.5,
+                $"Sidebar brand title is clipped: needs {formattedBrandTitle.WidthIncludingTrailingWhitespace:F1}px, has {brandTitle.ActualWidth:F1}px");
             Assert.DoesNotContain(
                 backendClient.Commands,
                 command => command.Arguments.Contains("--doctor", StringComparer.Ordinal));
@@ -222,8 +269,14 @@ public sealed class DesktopWindowSmokeTests
                 FindVisualChildren<TextBlock>(main),
                 textBlock => textBlock.Text == "重新生成支付链接");
             string[] headers = accountGrid.Columns.Select(column => column.Header?.ToString() ?? "").ToArray();
+            Assert.DoesNotContain("ID", headers);
             Assert.DoesNotContain("注册批次", headers);
             Assert.DoesNotContain("入库", headers);
+            DataGridColumn[] equalWidthColumns = accountGrid.Columns
+                .Where(column => new[] { "状态", "AT", "RT", "2FA" }.Contains(column.Header?.ToString() ?? ""))
+                .ToArray();
+            Assert.Equal(4, equalWidthColumns.Length);
+            Assert.Single(equalWidthColumns.Select(column => column.Width.Value).Distinct());
             DataGridColumn promotionColumn = Assert.Single(
                 accountGrid.Columns,
                 column => (column.Header?.ToString() ?? "") == "优惠状态");
@@ -477,6 +530,15 @@ public sealed class DesktopWindowSmokeTests
             secretBox.Password = "second-edit";
             Assert.Equal("second-edit", secretField.Value);
             Assert.NotNull(secretBox.GetBindingExpression(PasswordBoxBinding.BoundPasswordProperty));
+            var categoryList = FindVisualChildren<ListBox>(settings)
+                .Single(listBox => ReferenceEquals(listBox.ItemsSource, settingsViewModel.Categories));
+            categoryList.SelectedIndex = 0;
+            categoryList.UpdateLayout();
+            var selectedCategory = Assert.IsType<ListBoxItem>(categoryList.ItemContainerGenerator.ContainerFromIndex(0));
+            selectedCategory.ApplyTemplate();
+            var selectedChrome = Assert.IsType<Border>(selectedCategory.Template.FindName("ItemChrome", selectedCategory));
+            Assert.Equal(settings.FindResource("SettingsSelectionBg"), selectedChrome.Background);
+            Assert.Equal(settings.FindResource("SettingsSelectionBorder"), selectedChrome.BorderBrush);
             stage("verify settings layout");
             VerifySettingsLayout(settings, settingsViewModel);
             settings.Close();
@@ -517,6 +579,40 @@ public sealed class DesktopWindowSmokeTests
 
     private static void FlushDispatcher()
         => Dispatcher.CurrentDispatcher.Invoke(() => { }, DispatcherPriority.Background);
+
+    private static bool WaitForDispatcher(Func<bool> condition, TimeSpan timeout)
+    {
+        Dispatcher dispatcher = Dispatcher.CurrentDispatcher;
+        DateTime deadline = DateTime.UtcNow + timeout;
+        while (!condition())
+        {
+            if (DateTime.UtcNow >= deadline)
+                return false;
+
+            // Background, not Render.
+            //
+            // Render-priority work is only dispatched when a real render pass
+            // runs. GitHub's hosted Windows runner has no interactive desktop,
+            // so the render pass never happens, the BeginInvoke below is never
+            // invoked, and PushFrame blocks until the outer STA join times out
+            // (which reads as "did not finish in time", not as the real cause).
+            //
+            // Background (priority 4) sits below Render (7) and Loaded (6), so
+            // pushing a frame still drains every higher-priority item first —
+            // layout included — and exits regardless of whether rendering works.
+            var frame = new DispatcherFrame();
+            dispatcher.BeginInvoke(
+                DispatcherPriority.Background,
+                new Action(() => frame.Continue = false));
+            Dispatcher.PushFrame(frame);
+
+            // With Render there was a real frame interval between iterations.
+            // Without it the loop spins hot, so pace it explicitly.
+            Thread.Sleep(10);
+        }
+
+        return true;
+    }
 
     private static void InspectWindow(Window dialog, Action<Window> inspect)
     {
@@ -563,8 +659,11 @@ public sealed class DesktopWindowSmokeTests
         thread.SetApartmentState(ApartmentState.STA);
         thread.Start();
 
+        // 20 s was enough on a workstation but not on a hosted runner doing
+        // software rendering. The stage name in the failure is what actually
+        // identifies the hang, so a generous ceiling costs nothing but CI time.
         Assert.True(
-            thread.Join(TimeSpan.FromSeconds(20)),
+            thread.Join(TimeSpan.FromSeconds(90)),
             "WPF smoke test did not finish in time. Last stage: " + stage);
         Assert.Null(failure);
     }

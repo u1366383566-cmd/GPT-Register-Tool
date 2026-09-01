@@ -4,12 +4,11 @@ import os
 import re
 import sys
 import time
+from pathlib import Path
 
 from .config import CFG, initialize_runtime_config
 from .diagnostics import install_safe_stdio
-from .mailbox import _load_mailbox_pool, _remail_enabled
 from .paths import output_dir, runtime_file
-from .registration import _build_session_file, _mailbox_snapshot, run_email
 from .batch_runner import run_batch_impl as run_batch
 from .storage import database_path, get_paypal_url, list_paypal_accounts, rebuild_from_session_dir, upsert_account
 from .commands.helpers import (
@@ -25,15 +24,78 @@ from .commands import omakse as omakse_commands
 from .commands import payment as payment_commands
 from .commands import payment_links as payment_link_commands
 from .commands import registration as registration_commands
+from .commands.email_change import run_change_email
+from .proxy_routing import proxy_pool_for
+
+# `mailbox` and `registration` import `curl_cffi` at module top, so they must NOT
+# be imported eagerly at the top of this file — otherwise `import sms_tool.cli`
+# (and therefore the `--doctor` / `--desktop-read` lightweight commands) would
+# crash whenever curl_cffi is missing. They are loaded on demand, only on the
+# registration / one-click paths that actually need them.
+_heavy_deps_loaded = False
+
+# Module-level placeholders so these names always exist as attributes. This keeps
+# `import sms_tool.cli` free of curl_cffi (the real values are imported lazily by
+# _load_heavy_deps), while still letting tests `patch.object(cli, "...")` and direct
+# handler calls reference them without a NameError/AttributeError.
+_load_mailbox_pool = None
+_remail_enabled = None
+_build_session_file = None
+_mailbox_snapshot = None
+run_email = None
 
 
-def _configured_registration_proxy() -> str:
+def _load_heavy_deps() -> None:
+    global _heavy_deps_loaded
+    global _load_mailbox_pool, _remail_enabled, _build_session_file, _mailbox_snapshot, run_email
+    if _heavy_deps_loaded:
+        return
+    if _load_mailbox_pool is None or _remail_enabled is None:
+        from .mailbox import (
+            _load_mailbox_pool as _lmp,
+            _remail_enabled as _re,
+        )
+        if _load_mailbox_pool is None:
+            _load_mailbox_pool = _lmp
+        if _remail_enabled is None:
+            _remail_enabled = _re
+    if _build_session_file is None or _mailbox_snapshot is None or run_email is None:
+        from .registration import (
+            _build_session_file as _bsf,
+            _mailbox_snapshot as _ms,
+            run_email as _re2,
+        )
+        if _build_session_file is None:
+            _build_session_file = _bsf
+        if _mailbox_snapshot is None:
+            _mailbox_snapshot = _ms
+        if run_email is None:
+            run_email = _re2
+    _heavy_deps_loaded = True
+
+
+def _registration_proxy_lane(registration_driver: object = None) -> str:
+    from .registration_drivers.base import normalize_registration_driver
+    driver = normalize_registration_driver(registration_driver, CFG)
+    return "protocol_registration" if driver == "protocol" else "browser_registration"
+
+
+def _configured_registration_proxy(registration_driver: object = None) -> str:
     proxy_cfg = CFG.get("proxy") if isinstance(CFG.get("proxy"), dict) else {}
+    lane = _registration_proxy_lane(registration_driver)
+    lane_keys = (
+        ("browser_pool", "browser_registration_pool")
+        if lane == "browser_registration"
+        else ("protocol_pool", "protocol_registration_pool")
+    )
+    if CFG.get("registration_proxy") and not any(proxy_cfg.get(key) for key in (*lane_keys, "registration", "pool")):
+        return str(CFG["registration_proxy"]).strip()
+    values = proxy_pool_for(CFG, _registration_proxy_lane(registration_driver))
+    if values:
+        return values[0]
     return str(
-        proxy_cfg.get("registration")
-        or CFG.get("registration_proxy")
-        or proxy_cfg.get("default")
-        or "http://127.0.0.1:7897"
+        proxy_cfg.get("default")
+        or ""
     ).strip()
 
 
@@ -43,7 +105,7 @@ def _apply_registration_proxy_defaults(args) -> None:
     if str(getattr(args, "proxy_pool", "") or "").strip():
         args.proxy = None
         return
-    args.proxy = _configured_registration_proxy() or None
+    args.proxy = _configured_registration_proxy(getattr(args, "registration_driver", None)) or None
 
 
 def _proxy_pool_values(args) -> list[str]:
@@ -55,18 +117,16 @@ def _proxy_pool_values(args) -> list[str]:
     if values:
         return list(dict.fromkeys(values))
 
-    configured_primary = _configured_registration_proxy()
-    if configured_primary:
-        values.append(configured_primary)
-    proxy_cfg = CFG.get("proxy") if isinstance(CFG.get("proxy"), dict) else {}
-    configured = proxy_cfg.get("pool") or []
-    if isinstance(configured, str):
-        configured = re.split(r"[\r\n,;]+", configured)
-    values.extend(str(item or "").strip() for item in configured if str(item or "").strip())
+    values.extend(proxy_pool_for(CFG, _registration_proxy_lane(getattr(args, "registration_driver", None))))
+    if not values:
+        fallback = _configured_registration_proxy(getattr(args, "registration_driver", None))
+        if fallback:
+            values.append(fallback)
     return list(dict.fromkeys(values))
 
 
 def _registration_command_context():
+    _load_heavy_deps()
     return registration_commands.RegistrationCommandContext(
         proxy_pool_values=_proxy_pool_values,
         load_mailbox_pool=_load_mailbox_pool,
@@ -137,13 +197,13 @@ def _at_promotion_proxy_arg(args, payment_method="paypal"):
     return payment_commands.promotion_proxy_arg(args, payment_method, CFG)
 
 
-def main():
-    initialize_runtime_config()
-    for stream in (sys.stdout, sys.stderr):
-        if hasattr(stream, "reconfigure"):
-            stream.reconfigure(encoding="utf-8", errors="replace")
-    install_safe_stdio()
+def build_parser():
+    """Build the command-line argument parser.
 
+    Extracted from ``main`` so the argument set (including the
+    ``--registration-driver`` choices) is unit-testable without triggering the
+    runtime/config initialization that ``main`` performs.
+    """
     parser = argparse.ArgumentParser(description="ChatGPT Email Registration + PayPal link generation")
     parser.add_argument("--desktop-ipc", action="store_true", help=argparse.SUPPRESS)
     parser.add_argument("--desktop-serve", action="store_true", help=argparse.SUPPRESS)
@@ -185,6 +245,9 @@ def main():
     parser.add_argument("--smsbower-country", default=None, help="SMSBower country ID for phone registration (default: from config)")
     parser.add_argument("--skip-paypal-link", action="store_true", help=argparse.SUPPRESS)
     parser.add_argument("--registration-mode", choices=["passwordless", "password", "har", "legacy"], default=None, help="Registration auth mode: passwordless/HAR login_or_signup (default) or legacy password")
+    parser.add_argument("--registration-driver", choices=["protocol", "playwright", "roxy", "cloak", "camoufox", "adspower"], default=None, help="Registration driver (default: protocol)")
+    parser.add_argument("--browser-headless", dest="browser_headless", action="store_true", default=None, help="Run Playwright registration headless")
+    parser.add_argument("--browser-visible", dest="browser_headless", action="store_false", help="Run Playwright registration with a visible browser")
     parser.add_argument("--registration-batch-id", default=None, help="Stable registration cohort ID stored with active accounts and audit rows")
     parser.add_argument("--payment-method", "--payment-link-method", choices=_payment_method_choices(), default=None, help="Protocol payment-link method")
     parser.add_argument("--paypal-generation-type", default=None, help="Override PayPal link generation type: hosted_long_url, paypal_direct, or paypal_direct_zero_due")
@@ -193,7 +256,6 @@ def main():
     parser.add_argument("--delete-account", action="store_true", help="Delete/archive one or more accounts through the lifecycle adapter")
     parser.add_argument("--list-paypal-links", action="store_true", help="List saved PayPal payment links")
     parser.add_argument("--open-paypal-link", action="store_true", help="Open saved PayPal payment link for --email")
-    parser.add_argument("--mark-paypal-status", default=None, help="Update saved PayPal status for --email")
     parser.add_argument("--export-codex-json", action="store_true", help="Export paid account session as Codex JSON")
     parser.add_argument("--import-cpa", action="store_true", help="Import an existing AT-only session JSON into CPA/SUB2API")
     parser.add_argument("--register-and-import", action="store_true", help="Register new account(s), then import only the successful registrations into CPA/SUB2API")
@@ -321,6 +383,25 @@ def main():
     parser.add_argument("--phone-source", default=None, choices=["smsbower", "5sim", "phone_pool"], help="Override phone source for registration/one-click SMS (default: auto, prefers 5sim when both vendors are configured)")
     parser.add_argument("--max-reuse-count", type=int, default=0, help="Max times a phone can be reused (0=config default or 1)")
     parser.add_argument("--phone-send-cooldown", type=int, default=None, help="Seconds to wait before sending another OTP to the same phone")
+    parser.add_argument("--change-email", action="store_true", help="Batch change ChatGPT protocol email addresses")
+    parser.add_argument("--change-email-provider", choices=["remail", "cfworker", "smailr", "icloud", "outlook", "hotmail"], default=None)
+    parser.add_argument("--change-email-mailbox-file", default=None, help="Credential pool for persistent target email providers")
+    parser.add_argument("--change-email-workers", type=int, default=None)
+    parser.add_argument("--change-email-timeout", type=int, default=180)
+    parser.add_argument("--change-email-otp-timeout", type=int, default=300)
+    parser.add_argument("--change-email-service-mode", choices=["code", "purchase"], default="purchase")
+    parser.add_argument("--change-email-smailr-domain", default="")
+    return parser
+
+
+def main():
+    initialize_runtime_config()
+    for stream in (sys.stdout, sys.stderr):
+        if hasattr(stream, "reconfigure"):
+            stream.reconfigure(encoding="utf-8", errors="replace")
+    install_safe_stdio()
+
+    parser = build_parser()
     args = parser.parse_args()
     if args.register_and_import:
         args.import_cpa = True
@@ -341,7 +422,10 @@ def main():
         from .config import default_config_path
         from .doctor import print_doctor_report, run_doctor
 
-        report = run_doctor(CFG, str(default_config_path()))
+        # The canonical config now lives in the proxy/runtime/payment shards under
+        # the project root, so report the project root (not the legacy single
+        # config.json path) as the source to avoid a false bundled-fallback warning.
+        report = run_doctor(CFG, str(Path(default_config_path()).parent))
         if getattr(args, "json_output", False):
             print(json.dumps(report, ensure_ascii=False, indent=2))
         elif getattr(args, "desktop_ipc", False):
@@ -408,6 +492,17 @@ def main():
         if failures:
             raise SystemExit(3)
         return
+    if args.change_email:
+        from .account_email_change import EmailChangeRequest, change_email_batch, load_change_email_accounts
+        from .desktop_ipc import emit_result
+        run_change_email(
+            args,
+            load_accounts=load_change_email_accounts,
+            change_email_batch=change_email_batch,
+            request_type=EmailChangeRequest,
+            emit_result=emit_result,
+        )
+        return
     if args.rebuild_sqlite:
         count = rebuild_from_session_dir(base_dir)
         print(f"[*] SQLite rebuilt: {database_path()} ({count} account record(s))")
@@ -417,9 +512,6 @@ def main():
         return
     if args.open_paypal_link:
         _open_paypal_link(args.email)
-        return
-    if args.mark_paypal_status:
-        _mark_paypal_status(args)
         return
     if args.list_paypal_ba_queue:
         _list_paypal_ba_queue(args)
@@ -479,6 +571,7 @@ def main():
         _batch_auto_pay(args)
         return
 
+    _load_heavy_deps()
     _apply_registration_proxy_defaults(args)
 
     if args.one_click_sms:
@@ -584,11 +677,15 @@ def main():
                 print(f"[OK] Phone registered: {result.get('phone', '')} | AT: [REDACTED]")
             else:
                 print(f"[FAIL] {result.get('error', 'unknown')}")
-        _save_registration_results(
+        report = _save_registration_results(
             args, results, effective_count=effective_count, base_dir=base_dir,
             pipeline_started=pipeline_started, mailbox_seconds=0,
             register_seconds=time.time() - register_started,
         )
+        if bool(getattr(args, "desktop_ipc", False)):
+            from .desktop_ipc import emit_result
+
+            emit_result(report, enabled=True)
         return
 
     register_started = time.time()
@@ -616,7 +713,8 @@ def main():
             phone_pool=phone_pool,
             codex_oauth=False,
             registration_mode=args.registration_mode,
-            browser_headless=bool(getattr(args, "browser_headless", False)),
+            registration_driver=getattr(args, "registration_driver", None),
+            browser_headless=getattr(args, "browser_headless", None),
             enroll_2fa=not getattr(args, "no_2fa", False),
             run_email_func=run_email,
             on_result=persist_completed_result,
@@ -624,22 +722,23 @@ def main():
     else:
         mailbox = mailboxes[0] if mailboxes else None
         proxy_pool = _proxy_pool_values(args)
-        if len(proxy_pool) > 1:
-            from .batch_runner import select_registration_proxy_base
-            selected_proxy = select_registration_proxy_base(proxy_pool, args.proxy)
-            proxy_pool = [selected_proxy] if selected_proxy else []
-        results = [run_email(
-            proxy=(proxy_pool[0] if proxy_pool else args.proxy),
-            password=args.password,
-            mailbox=mailbox,
+        results = run_batch(
+            count=1,
+            proxy=args.proxy,
+            proxy_pool=proxy_pool,
+            mailboxes=[mailbox] if mailbox else [],
+            workers=1,
             phone_pool=phone_pool,
             codex_oauth=False,
             registration_mode=args.registration_mode,
+            registration_driver=getattr(args, "registration_driver", None),
+            browser_headless=getattr(args, "browser_headless", None),
             enroll_2fa=not getattr(args, "no_2fa", False),
-        )]
+            run_email_func=run_email,
+        )
     register_seconds = time.time() - register_started
 
-    _save_registration_results(
+    report = _save_registration_results(
         args,
         results,
         effective_count=effective_count,
@@ -648,6 +747,10 @@ def main():
         mailbox_seconds=mailbox_seconds,
         register_seconds=register_seconds,
     )
+    if bool(getattr(args, "desktop_ipc", False)):
+        from .desktop_ipc import emit_result
+
+        emit_result(report, enabled=True)
 
 
 def _save_registration_results(
@@ -698,10 +801,6 @@ def _print_paypal_links(email=""):
 
 def _open_paypal_link(email):
     return account_commands.open_paypal_link(email, _account_command_context())
-
-
-def _mark_paypal_status(args):
-    return account_commands.mark_paypal_status(args, _account_command_context())
 
 
 def _refresh_session(args):
@@ -834,6 +933,7 @@ def _process_paypal_ba_queue(args):
 
 
 def _one_click_command_context():
+    _load_heavy_deps()
     return one_click_commands.OneClickCommandContext(
         load_mailbox_pool=_load_mailbox_pool,
         max_reuse=_one_click_sms_max_reuse,
@@ -844,6 +944,7 @@ def _one_click_command_context():
 
 
 def _one_click_sms(args):
+    _load_heavy_deps()
     return one_click_commands.one_click_sms(args, _one_click_command_context())
 
 

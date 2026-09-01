@@ -184,23 +184,14 @@ namespace SmsWorkbench
         }
 
         private void OneClickSms_Click(object sender, RoutedEventArgs e)
-            => RunUiTask(OneClickSmsAsync);
+            => RunUiTask(() => OneClickSmsAsync());
 
-        private async Task OneClickSmsAsync()
+        private async Task OneClickSmsAsync(CancellationToken ct = default)
         {
             var rows = SelectedEmailRowsOrNotify("接码");
             if (rows.Count == 0) return;
 
-            string provider = await ShowOneClickSmsProviderDialogAsync();
-            if (string.IsNullOrWhiteSpace(provider))
-            {
-                return;
-            }
-
-            bool confirmed = provider == "5sim"
-                ? await ShowFiveSimOneClickDialogAsync()
-                : await ShowSmsBowerOneClickDialogAsync();
-            if (!confirmed)
+            if (!await ShowSmsBowerOneClickDialogAsync())
             {
                 return;
             }
@@ -217,8 +208,7 @@ namespace SmsWorkbench
                 mailboxFile,
                 rows.Select(r => r.Identifier.Trim()).ToList(),
                 rows.Count == 1 ? SessionFileFor(rows[0]) : "",
-                GetRegistrationProxyPool(),
-                phoneSource: provider);
+                GetRegistrationProxyPool());
             // Ensure temp files are cleaned up by the coordinator
             RunBackend(plan.TaskName, plan.Arguments.ToList());
         }
@@ -473,7 +463,7 @@ namespace SmsWorkbench
             var promotionBox = new CheckBox
             {
                 Content = "注册完成后查询试用优惠",
-                IsChecked = false,
+                IsChecked = true,
                 Margin = new Thickness(0, 0, 0, 10),
                 Foreground = (System.Windows.Media.Brush)FindResource("TextMain")
             };
@@ -587,7 +577,7 @@ namespace SmsWorkbench
             var promotionBox = new CheckBox
             {
                 Content = "注册完成后查询试用优惠",
-                IsChecked = false,
+                IsChecked = true,
                 Margin = new Thickness(0, 0, 0, 10),
                 Foreground = (System.Windows.Media.Brush)FindResource("TextMain")
             };
@@ -703,7 +693,6 @@ namespace SmsWorkbench
         private bool HasRegisteredAccountState(PoolRow row)
         {
             string status = row.Status ?? "";
-            if (IsPayPalCompletedRow(row)) return true;
             return status.Contains("已注册")
                 || status.Contains("PayPal")
                 || status.Contains("支付完成")

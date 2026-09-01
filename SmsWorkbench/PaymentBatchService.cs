@@ -30,14 +30,15 @@ namespace SmsWorkbench
     public sealed class PaymentBatchService : IPaymentBatchService, IPaymentBatchProgressService
     {
         private static readonly string[] ListSeparators = ["\r\n", "\n", ",", ";"];
+        private const string PoolLineSeparator = ProxyInputNormalizer.LineSeparator;
         private static readonly JsonSerializerOptions IndentedJson = new() { WriteIndented = true };
         private readonly IApplicationPaths _paths;
-        private readonly IBackendClient _backendClient;
+        private readonly IBackendTaskCoordinator _backendTasks;
 
-        public PaymentBatchService(IApplicationPaths paths, IBackendClient backendClient)
+        public PaymentBatchService(IApplicationPaths paths, IBackendTaskCoordinator backendTasks)
         {
             _paths = paths;
-            _backendClient = backendClient;
+            _backendTasks = backendTasks;
         }
 
         public IReadOnlyList<PaymentMatrixRow> LoadMatrix(string paymentMethod)
@@ -45,7 +46,7 @@ namespace SmsWorkbench
             var output = new List<PaymentMatrixRow>();
             try
             {
-                JsonNode root = JsonNode.Parse(File.ReadAllText(Path.Combine(_paths.RootDirectory, "config.json"), Encoding.UTF8));
+                JsonNode root = ConfigStore.ReadMerged(_paths) ?? new JsonObject();
                 JsonArray cells = root?["protocol_payments"]?["matrix"]?["cells"] as JsonArray;
                 foreach (JsonNode node in cells ?? new JsonArray())
                 {
@@ -86,7 +87,7 @@ namespace SmsWorkbench
 
             try
             {
-                JsonNode root = JsonNode.Parse(File.ReadAllText(Path.Combine(_paths.RootDirectory, "config.json"), Encoding.UTF8));
+                JsonNode root = ConfigStore.ReadMerged(_paths) ?? new JsonObject();
                 JsonObject protocol = root?["protocol_payments"] as JsonObject;
                 JsonObject methods = protocol?["methods"] as JsonObject;
                 JsonObject legacy = root?[method] as JsonObject;
@@ -141,7 +142,9 @@ namespace SmsWorkbench
                     NormalizePoolText(approvePool),
                     checkoutCountry,
                     approveCountry,
-                    updateCountry);
+                    updateCountry,
+                    NormalizePoolText(checkoutPool),
+                    NormalizePoolText(approvePool));
             }
             catch
             {
@@ -168,6 +171,18 @@ namespace SmsWorkbench
             if (!ValidCountry(checkoutCountry) || !ValidCountry(approveCountry) || !ValidCountry(updateCountry))
                 return new SettingsSaveResult(false, "代理出口国家必须为空或两位字母代码。");
 
+            // The region-filtered active pool the UI shows for the selected
+            // country; persisted to checkout_proxy_pool so the backend's stage
+            // planner receives exactly the zone the operator chose.  The full
+            // mixed source pool is persisted under the named <method>_* pool so
+            // switching countries never drops the other zones.
+            string checkoutSource = !string.IsNullOrWhiteSpace(configuration?.CheckoutProxySourcePool)
+                ? configuration!.CheckoutProxySourcePool!
+                : configuration?.CheckoutProxyPool ?? "";
+            string approveSource = !string.IsNullOrWhiteSpace(configuration?.ApproveProxySourcePool)
+                ? configuration!.ApproveProxySourcePool!
+                : configuration?.ApproveProxyPool ?? "";
+
             try
             {
                 JsonObject root = ReadConfigRoot();
@@ -178,8 +193,8 @@ namespace SmsWorkbench
                 string[] approvePool = NormalizePool(configuration?.ApproveProxyPool);
                 string checkoutPoolName = method + "_checkout";
                 string approvePoolName = method + "_approve";
-                SetArray(proxyPools, checkoutPoolName, checkoutPool);
-                SetArray(proxyPools, approvePoolName, approvePool);
+                SetArray(proxyPools, checkoutPoolName, NormalizePool(checkoutSource));
+                SetArray(proxyPools, approvePoolName, NormalizePool(approveSource));
                 SetArray(methodConfig, "checkout_proxy_pool", checkoutPool);
                 SetArray(methodConfig, "approve_proxy_pool", approvePool);
 
@@ -289,13 +304,13 @@ namespace SmsWorkbench
                 AddPoolArgument(arguments, "--approve-proxy-pool", request.ApproveProxyPool);
                 AddCountryArgument(arguments, "--checkout-proxy-country", request.CheckoutCountry);
                 AddCountryArgument(arguments, "--approve-proxy-country", request.ApproveCountry);
-                AddCountryArgument(arguments, "--update-proxy-country", request.ApproveCountry);
+                AddCountryArgument(arguments, "--update-proxy-country", request.UpdateCountry);
 
                 int waveSize = request.Canary > 0 ? Math.Min(request.Canary, request.Accounts.Count) : request.Accounts.Count;
                 int waves = Math.Max(1, (int)Math.Ceiling(waveSize / (double)Math.Max(1, request.Workers)));
                 long timeout = Math.Max(120000L, (long)GetMethodTimeoutMilliseconds(request.PaymentMethod) * waves);
                 timeout = Math.Min(12L * 60 * 60 * 1000, timeout);
-                BackendCommandResult result = await _backendClient.RunAsync(
+                BackendCommandResult result = await _backendTasks.RunAsync(
                     BackendCommand.Create(
                         "批量协议支付",
                         arguments,
@@ -338,9 +353,12 @@ namespace SmsWorkbench
             AddPoolArgument(arguments, "--approve-proxy-pool", approveProxyPool);
             AddCountryArgument(arguments, "--checkout-proxy-country", checkoutCountry);
             AddCountryArgument(arguments, "--approve-proxy-country", approveCountry);
-            AddCountryArgument(arguments, "--update-proxy-country", approveCountry);
+            // The promotion/update rotation country is a distinct concept from
+            // the approve country. It comes from the persisted per-method stage
+            // configuration, never from the approve selection.
+            AddCountryArgument(arguments, "--update-proxy-country", LoadProxyConfiguration(paymentMethod).UpdateCountry);
 
-            BackendCommandResult result = await _backendClient.RunAsync(
+            BackendCommandResult result = await _backendTasks.RunAsync(
                 BackendCommand.Create("测试代理", arguments, 120000),
                 cancellationToken: cancellationToken);
 
@@ -358,7 +376,7 @@ namespace SmsWorkbench
             int seconds = 900;
             try
             {
-                JsonNode root = JsonNode.Parse(File.ReadAllText(Path.Combine(_paths.RootDirectory, "config.json"), Encoding.UTF8));
+                JsonNode root = ConfigStore.ReadMerged(_paths) ?? new JsonObject();
                 JsonNode protocol = root?["protocol_payments"];
                 if (int.TryParse(protocol?["timeout_seconds"]?.ToString(), out int configured))
                     seconds = configured;
@@ -418,16 +436,16 @@ namespace SmsWorkbench
             foreach (object value in values)
             {
                 if (value is string[] array && array.Length > 0)
-                    return string.Join(Environment.NewLine, array);
+                    return string.Join(PoolLineSeparator, array);
                 string text = value switch
                 {
-                    JsonArray jsonArray => string.Join(Environment.NewLine, jsonArray.Select(item => item?.ToString() ?? "").Where(item => item.Length > 0)),
+                    JsonArray jsonArray => string.Join(PoolLineSeparator, jsonArray.Select(item => item?.ToString() ?? "").Where(item => item.Length > 0)),
                     JsonNode node => node.ToString(),
                     _ => value?.ToString() ?? ""
                 };
                 string[] parsed = ParseList(text);
                 if (parsed.Length > 0)
-                    return string.Join(Environment.NewLine, parsed);
+                    return string.Join(PoolLineSeparator, parsed);
             }
             return "";
         }
@@ -453,39 +471,25 @@ namespace SmsWorkbench
             => ProxyInputNormalizer.NormalizeList(value);
 
         private static string NormalizePoolText(string value)
-            => string.Join(Environment.NewLine, NormalizePool(value));
+            => string.Join(PoolLineSeparator, NormalizePool(value));
 
         private static bool ValidCountry(string value)
             => value.Length == 0 || Regex.IsMatch(value, "^[A-Z]{2}$", RegexOptions.CultureInvariant);
 
-        private static JsonObject ReadConfigRoot(string path)
-            => JsonNode.Parse(File.ReadAllText(path, Encoding.UTF8)) as JsonObject ?? new JsonObject();
-
         private JsonObject ReadConfigRoot()
         {
-            string path = Path.Combine(_paths.RootDirectory, "config.json");
-            if (!File.Exists(path))
-            {
-                string example = Path.Combine(_paths.RootDirectory, "config.example.json");
-                if (File.Exists(example)) File.Copy(example, path);
-                else File.WriteAllText(path, "{}", new UTF8Encoding(false));
-            }
-            return ReadConfigRoot(path);
+            // Merge the proxy/runtime/payment shards (or migrate a legacy single
+            // config.json); an empty object lets a first-time save create the
+            // payment shard without needing a pre-existing file.
+            return ConfigStore.ReadMerged(_paths) ?? new JsonObject();
         }
 
         private void WriteConfigRoot(JsonObject root)
         {
-            string path = Path.Combine(_paths.RootDirectory, "config.json");
-            string temporary = path + ".tmp." + Guid.NewGuid().ToString("N");
-            try
-            {
-                File.WriteAllText(temporary, root.ToJsonString(IndentedJson), new UTF8Encoding(false));
-                File.Move(temporary, path, overwrite: true);
-            }
-            finally
-            {
-                TryDelete(temporary);
-            }
+            // Persist back into the shards. Protocol-payment keys land in
+            // payment.json; any other keys present in the merged root are routed
+            // to their owning shard by ConfigStore.
+            ConfigStore.WriteShards(_paths, root);
         }
 
         private static JsonObject EnsureObject(JsonObject root, params string[] path)

@@ -17,17 +17,7 @@ from pathlib import Path
 from typing import Optional
 
 from .config import CFG
-from .fivesim import (
-    DEFAULT_COUNTRY as FIVESIM_DEFAULT_COUNTRY,
-    DEFAULT_ENDPOINT as FIVESIM_DEFAULT_ENDPOINT,
-    DEFAULT_OPERATOR as FIVESIM_DEFAULT_OPERATOR,
-    OPENAI_PRODUCT,
-    FiveSimClient,
-    normalize_country as fivesim_normalize_country,
-    normalize_operator,
-    normalize_phone as fivesim_normalize_phone,
-    normalize_product,
-)
+from .cross_process_gate import cross_process_write_lock
 from .smsbower import (
     DEFAULT_ENDPOINT,
     GHANA_COUNTRY_CODE,
@@ -42,13 +32,35 @@ from .sms_provider import SmsProviderAdapter, provider_name
 
 SMSBOWER_NO_NUMBERS_MAX_ATTEMPTS = 10
 SMSBOWER_PHONE_IN_USE_MAX_ATTEMPTS = 10
-FIVESIM_NO_NUMBERS_MAX_ATTEMPTS = 10
 
-# Rental providers buy a number per activation from an external SMS vendor
-# and share the same lifecycle (prepare / wait_code / complete / cancel).
-RENTAL_PROVIDERS = {"smsbower", "5sim"}
 
-PLACEHOLDER_KEYS = {"", "YOUR_SMSBOWER_API_KEY", "$SMSBOWER_API_KEY", "YOUR_5SIM_API_KEY", "$5SIM_API_KEY"}
+def _atomic_write_text(path: Path, text: str) -> None:
+    """Write ``text`` to ``path`` atomically (temp file + os.replace).
+
+    A crash mid-write leaves the previous file intact, so a concurrent reader
+    (or the next process) never sees a torn JSON state. The temp file lives in
+    the same directory as ``path`` so os.replace is a rename on the same volume.
+    """
+    directory = path.parent
+    directory.mkdir(parents=True, exist_ok=True)
+    import tempfile
+
+    fd, tmp_name = tempfile.mkstemp(dir=directory, prefix=f".{path.stem}.", suffix=".tmp")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            handle.write(text)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(tmp_name, path)
+    except BaseException:
+        try:
+            os.unlink(tmp_name)
+        except OSError:
+            pass
+        raise
+
+
+PLACEHOLDER_KEYS = {"", "YOUR_SMSBOWER_API_KEY", "$SMSBOWER_API_KEY"}
 
 
 @dataclass
@@ -64,8 +76,6 @@ class PhoneSlot:
     max_price: str = "0.06"
     target_price: str = "0.054"
     provider_ids: str = ""
-    product: str = ""
-    operator: str = ""
     activation_id: str = ""
     reuse_count: int = 0
     max_reuse_count: int = 1
@@ -141,8 +151,12 @@ class PhonePool:
             "updated_at": int(time.time()),
         }
         path = Path(self.state_file)
-        path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(json.dumps(state, ensure_ascii=False, indent=2), encoding="utf-8")
+        # Serialise across processes: two backend processes must not interleave
+        # writes, or the same phone number can be handed to two accounts.
+        # _atomic_write_text guarantees a reader never sees a half-written file.
+        lock_path = path.with_name(f"{path.name}.lock")
+        with cross_process_write_lock(lock_path):
+            _atomic_write_text(path, json.dumps(state, ensure_ascii=False, indent=2))
 
     def load_state(self):
         if not self.state_file:
@@ -179,14 +193,14 @@ class PhonePool:
             phone.total_verified = int(saved.get("total_verified") or 0)
             phone.last_sms_code = str(saved.get("last_sms_code") or "")
             phone.slot_id = phone.slot_id or str(saved.get("slot_id") or f"slot:{index}")
-            if phone.provider in RENTAL_PROVIDERS and (not phone.phone or not phone.activation_id):
+            if phone.provider == "smsbower" and (not phone.phone or not phone.activation_id):
                 phone.reuse_count = 0
                 phone.last_sms_code = ""
 
     def reset_exhausted_smsbower_slots(self) -> int:
         reset_count = 0
         for phone in self.phones:
-            if phone.provider not in RENTAL_PROVIDERS or not phone.is_exhausted:
+            if phone.provider != "smsbower" or not phone.is_exhausted:
                 continue
             old_phone = phone.phone
             old_activation_id = phone.activation_id
@@ -221,8 +235,6 @@ def _state_for_phone(phone: PhoneSlot) -> dict:
         "max_price": phone.max_price,
         "target_price": phone.target_price,
         "provider_ids": phone.provider_ids,
-        "product": phone.product,
-        "operator": phone.operator,
         "activation_id": phone.activation_id,
         "reuse_count": phone.reuse_count,
         "max_reuse_count": phone.max_reuse_count,
@@ -241,17 +253,6 @@ def _saved_state_matches_slot(phone: PhoneSlot, saved: dict) -> bool:
     saved_provider = str(saved.get("provider") or "").strip()
     if saved_provider and saved_provider != phone.provider:
         return False
-    if phone.provider == "5sim":
-        saved_country = str(saved.get("country") or "").strip()
-        saved_operator = str(saved.get("operator") or "").strip()
-        saved_product = str(saved.get("product") or "").strip()
-        saved_max_price = str(saved.get("max_price") or "").strip()
-        return (
-            (not saved_country or fivesim_normalize_country(saved_country) == fivesim_normalize_country(phone.country))
-            and (not saved_operator or normalize_operator(saved_operator) == normalize_operator(phone.operator))
-            and (not saved_product or normalize_product(saved_product) == normalize_product(phone.product))
-            and (not saved_max_price or saved_max_price == str(phone.max_price or "").strip())
-        )
     if phone.provider == "smsbower":
         saved_service = str(saved.get("service") or "").strip()
         saved_country = str(saved.get("country") or "").strip()
@@ -297,11 +298,7 @@ def _send_retry_delay_seconds(cfg: dict | None = None) -> int:
 def _number_attempts(cfg: dict | None = None) -> int:
     cfg = cfg if isinstance(cfg, dict) else _phone_reuse_cfg()
     smsbower_cfg = cfg.get("smsbower") if isinstance(cfg.get("smsbower"), dict) else {}
-    five_sim_cfg = cfg.get("5sim") if isinstance(cfg.get("5sim"), dict) else {}
-    return max(
-        1,
-        _int_value(smsbower_cfg.get("number_attempts") or five_sim_cfg.get("number_attempts") or cfg.get("number_attempts"), 3),
-    )
+    return max(1, _int_value(smsbower_cfg.get("number_attempts") or cfg.get("number_attempts"), 3))
 
 
 def _resolve_secret(value: str, env_name: str) -> str:
@@ -325,25 +322,14 @@ def _smsbower_api_key(cfg: dict | None = None) -> str:
     return _resolve_secret(str(cfg.get("api_key") or ""), "SMSBOWER_API_KEY")
 
 
-def _fivesim_api_key(cfg: dict | None = None) -> str:
-    cfg = cfg if isinstance(cfg, dict) else (_phone_reuse_cfg().get("5sim") or {})
-    return _resolve_secret(str(cfg.get("api_key") or ""), "5SIM_API_KEY")
-
-
 def has_phone_reuse_config() -> bool:
     cfg = _phone_reuse_cfg()
     source = _phone_source(cfg)
     if source == "phone_pool":
         return bool(cfg.get("phone_pool"))
-    if source == "5sim":
-        five_sim_cfg = cfg.get("5sim") if isinstance(cfg.get("5sim"), dict) else {}
-        return bool(_fivesim_api_key(five_sim_cfg))
     if source == "smsbower":
         smsbower_cfg = cfg.get("smsbower") if isinstance(cfg.get("smsbower"), dict) else {}
         return bool(_smsbower_api_key(smsbower_cfg))
-    five_sim_cfg = cfg.get("5sim") if isinstance(cfg.get("5sim"), dict) else {}
-    if _fivesim_api_key(five_sim_cfg):
-        return True
     smsbower_cfg = cfg.get("smsbower") if isinstance(cfg.get("smsbower"), dict) else {}
     if _smsbower_api_key(smsbower_cfg):
         return True
@@ -360,8 +346,6 @@ def _phone_source(cfg: dict | None = None) -> str:
     source = str(cfg.get("source") or cfg.get("mode") or "auto").strip().lower()
     if source in {"smsbower", "sms_bower", "platform", "provider"}:
         return "smsbower"
-    if source in {"5sim", "five_sim", "fivesim", "five-sim", "fivesim.net"}:
-        return "5sim"
     if source in {"phone_pool", "static", "legacy", "sms_link", "link"}:
         return "phone_pool"
     return "auto"
@@ -385,40 +369,9 @@ def create_phone_pool(
     number_attempts = _number_attempts(cfg)
     phones: list[PhoneSlot] = []
 
-    five_sim_cfg = cfg.get("5sim") if isinstance(cfg.get("5sim"), dict) else {}
     smsbower_cfg = cfg.get("smsbower") if isinstance(cfg.get("smsbower"), dict) else {}
-    five_sim_key = _fivesim_api_key(five_sim_cfg)
-    smsbower_key = _smsbower_api_key(smsbower_cfg)
-    # auto prefers 5sim when both providers are configured.
-    use_five_sim = bool(five_sim_key) and source in {"auto", "5sim"}
-    use_smsbower = bool(smsbower_key) and source in {"auto", "smsbower"} and not (source == "auto" and use_five_sim)
-
-    if use_five_sim:
-        pool_size = max(1, _int_value(five_sim_cfg.get("pool_size"), 1))
-        country = five_sim_cfg.get("country") or FIVESIM_DEFAULT_COUNTRY
-        operator = normalize_operator(five_sim_cfg.get("operator") or FIVESIM_DEFAULT_OPERATOR)
-        product = normalize_product(five_sim_cfg.get("product") or OPENAI_PRODUCT)
-        for index in range(pool_size):
-            phones.append(PhoneSlot(
-                phone="",
-                provider="5sim",
-                api_key=five_sim_key,
-                endpoint=str(five_sim_cfg.get("endpoint") or FIVESIM_DEFAULT_ENDPOINT).strip() or FIVESIM_DEFAULT_ENDPOINT,
-                country=country,
-                operator=operator,
-                product=product,
-                max_price=str(five_sim_cfg.get("max_price") or "").strip(),
-                max_reuse_count=max_reuse,
-                slot_id=f"5sim:{index}",
-                sms_timeout=_int_value(five_sim_cfg.get("sms_timeout"), 120),
-                sms_poll_interval=_int_value(five_sim_cfg.get("sms_poll_interval"), 5),
-                send_cooldown_seconds=_int_value(five_sim_cfg.get("send_cooldown_seconds"), send_cooldown),
-                send_retry_attempts=_int_value(five_sim_cfg.get("send_retry_attempts"), send_retries),
-                send_retry_delay_seconds=_int_value(five_sim_cfg.get("send_retry_delay_seconds"), send_retry_delay),
-                number_attempts=_int_value(five_sim_cfg.get("number_attempts"), number_attempts),
-            ))
-
-    if use_smsbower:
+    api_key = _smsbower_api_key(smsbower_cfg)
+    if api_key and source != "phone_pool":
         pool_size = max(1, _int_value(smsbower_cfg.get("pool_size"), 1))
         service = normalize_service(smsbower_cfg.get("service") or OPENAI_SERVICE_CODE)
         country = smsbower_cfg.get("country") or GHANA_COUNTRY_CODE
@@ -426,7 +379,7 @@ def create_phone_pool(
             phones.append(PhoneSlot(
                 phone="",
                 provider="smsbower",
-                api_key=smsbower_key,
+                api_key=api_key,
                 endpoint=str(smsbower_cfg.get("endpoint") or DEFAULT_ENDPOINT).strip() or DEFAULT_ENDPOINT,
                 service=service,
                 country=country,
@@ -444,13 +397,13 @@ def create_phone_pool(
                 number_attempts=_int_value(smsbower_cfg.get("number_attempts"), number_attempts),
             ))
 
-    if not phones and source not in {"smsbower", "5sim"}:
+    if not phones and source != "smsbower":
         for index, entry in enumerate(cfg.get("phone_pool") or []):
             slot = _slot_from_static_entry(entry, max_reuse, f"phone_pool:{index}")
             if slot:
                 phones.append(slot)
 
-    if not phones and source not in {"smsbower", "5sim"}:
+    if not phones and source != "smsbower":
         paypal_cfg = CFG.get("paypal_auto") if isinstance(CFG.get("paypal_auto"), dict) else {}
         phone_numbers = paypal_cfg.get("phone_numbers") or []
         for index, entry in enumerate(phone_numbers):
@@ -483,27 +436,6 @@ def _slot_from_static_entry(entry: dict, max_reuse: int, slot_id: str) -> Option
     if not isinstance(entry, dict):
         return None
     provider = str(entry.get("provider") or "legacy").strip()
-    if provider == "5sim":
-        api_key = _resolve_secret(str(entry.get("api_key") or ""), "5SIM_API_KEY")
-        if not api_key:
-            return None
-        return PhoneSlot(
-            phone=fivesim_normalize_phone(entry.get("phone") or ""),
-            provider="5sim",
-            api_key=api_key,
-            endpoint=str(entry.get("endpoint") or FIVESIM_DEFAULT_ENDPOINT).strip() or FIVESIM_DEFAULT_ENDPOINT,
-            country=entry.get("country") or FIVESIM_DEFAULT_COUNTRY,
-            operator=normalize_operator(entry.get("operator") or FIVESIM_DEFAULT_OPERATOR),
-            product=normalize_product(entry.get("product") or OPENAI_PRODUCT),
-            max_price=str(entry.get("max_price") or "").strip(),
-            max_reuse_count=max_reuse,
-            slot_id=slot_id,
-            sms_timeout=_int_value(entry.get("sms_timeout"), 120),
-            sms_poll_interval=_int_value(entry.get("sms_poll_interval"), 5),
-            send_cooldown_seconds=_int_value(entry.get("send_cooldown_seconds"), _send_cooldown_seconds()),
-            send_retry_attempts=_int_value(entry.get("send_retry_attempts"), _send_retry_attempts()),
-            send_retry_delay_seconds=_int_value(entry.get("send_retry_delay_seconds"), _send_retry_delay_seconds()),
-        )
     if provider == "smsbower":
         api_key = _resolve_secret(str(entry.get("api_key") or ""), "SMSBOWER_API_KEY")
         if not api_key:
@@ -555,104 +487,6 @@ def _country_candidates(value) -> list[str]:
 
 def _smsbower_client(slot: PhoneSlot) -> SmsBowerClient:
     return SmsBowerClient(api_key=slot.api_key, endpoint=slot.endpoint)
-
-
-def _fivesim_country_candidates(value) -> list[str]:
-    if isinstance(value, (list, tuple)):
-        candidates = [fivesim_normalize_country(item) for item in value]
-    else:
-        candidates = [fivesim_normalize_country(value)]
-    return [item for item in candidates if item]
-
-
-def _fivesim_client(slot: PhoneSlot) -> FiveSimClient:
-    return FiveSimClient(api_key=slot.api_key, endpoint=slot.endpoint)
-
-
-def _acquire_five_sim_number(slot: PhoneSlot) -> bool:
-    client = _fivesim_client(slot)
-    countries = _fivesim_country_candidates(slot.country)
-    product = normalize_product(slot.product or OPENAI_PRODUCT)
-    operator = normalize_operator(slot.operator or FIVESIM_DEFAULT_OPERATOR)
-    for country in countries:
-        for attempt in range(1, FIVESIM_NO_NUMBERS_MAX_ATTEMPTS + 1):
-            try:
-                activation = client.get_number(
-                    country=country,
-                    operator=operator,
-                    product=product,
-                    max_price=slot.max_price,
-                )
-            except Exception as exc:
-                error = str(exc)
-                print(f"  [5sim] country={country} acquire failed ({attempt}/{FIVESIM_NO_NUMBERS_MAX_ATTEMPTS}): {error}")
-                lowered = error.lower()
-                if any(marker in lowered for marker in ("not enough user balance", "not enough rating", "unauthorized", "401")):
-                    return False
-                if "no free phones" not in lowered:
-                    break
-                if slot.activation_id:
-                    client.cancel(slot.activation_id)
-                    _reset_five_sim_slot(slot)
-                if attempt < FIVESIM_NO_NUMBERS_MAX_ATTEMPTS:
-                    time.sleep(1)
-                continue
-            previous_phone = slot.phone
-            slot.phone = fivesim_normalize_phone(activation.phone)
-            slot.activation_id = activation.activation_id
-            slot.country = activation.country
-            slot.operator = activation.operator
-            slot.product = activation.product
-            if not previous_phone or previous_phone != slot.phone:
-                slot.reuse_count = 0
-                slot.last_sms_code = ""
-            print(
-                "  [5sim] acquired "
-                f"{slot.phone} (id={slot.activation_id}, country={country}, price={activation.price})"
-            )
-            return True
-    return False
-
-
-def _prepare_five_sim_for_send(slot: PhoneSlot) -> bool:
-    if not slot.activation_id or not slot.phone:
-        return _acquire_five_sim_number(slot)
-    if slot.reuse_count <= 0:
-        return True
-    # 5sim has no "request another code" call; cancel and acquire a fresh number.
-    _cancel_five_sim_activation(slot)
-    return _acquire_five_sim_number(slot)
-
-
-def _wait_five_sim_code(slot: PhoneSlot) -> Optional[str]:
-    return _fivesim_client(slot).wait_for_code(
-        slot.activation_id,
-        timeout=slot.sms_timeout,
-        poll_interval=slot.sms_poll_interval,
-        previous_code=slot.last_sms_code,
-    )
-
-
-def _reset_five_sim_slot(slot: PhoneSlot):
-    _reset_provider_slot(slot)
-
-
-def _complete_five_sim_activation(slot: PhoneSlot):
-    if slot.activation_id:
-        client = _fivesim_client(slot)
-        activation_id = slot.activation_id
-        if client.complete(activation_id):
-            print(f"  [5sim] order {activation_id} completed")
-        else:
-            client.cancel(activation_id)
-            print(f"  [5sim] order {activation_id} completion failed; cancelled")
-    _reset_five_sim_slot(slot)
-
-
-def _cancel_five_sim_activation(slot: PhoneSlot):
-    if slot.activation_id:
-        _fivesim_client(slot).cancel(slot.activation_id)
-    _reset_five_sim_slot(slot)
 
 
 def _price_matches(left, right) -> bool:
@@ -787,7 +621,7 @@ def _is_terminal_validate_rejection(result: dict) -> bool:
 
 
 def _retire_phone_slot_for_batch(phone_pool: PhonePool, phone_slot: PhoneSlot, reason: str):
-    if phone_slot.provider in RENTAL_PROVIDERS:
+    if phone_slot.provider == "smsbower":
         _cancel_provider_activation(phone_slot)
     phone_slot.reuse_count = max(1, int(phone_slot.max_reuse_count or 1))
     print(f"[!] Phone slot retired for this batch: {reason}")
@@ -899,28 +733,10 @@ class _SmsBowerProviderAdapter(SmsProviderAdapter):
         _cancel_smsbower_activation(self.slot)
 
 
-class _FiveSimProviderAdapter(SmsProviderAdapter):
-    provider_key = "5sim"
-
-    def prepare(self) -> bool:
-        return _prepare_five_sim_for_send(self.slot)
-
-    def wait_code(self) -> Optional[str]:
-        return _wait_five_sim_code(self.slot)
-
-    def complete(self) -> None:
-        _complete_five_sim_activation(self.slot)
-
-    def cancel(self) -> None:
-        _cancel_five_sim_activation(self.slot)
-
-
 def _sms_provider_adapter(slot: PhoneSlot) -> SmsProviderAdapter:
     name = provider_name(slot)
     if name == "smsbower":
         return _SmsBowerProviderAdapter(slot)
-    if name == "5sim":
-        return _FiveSimProviderAdapter(slot)
     return _StaticSmsProviderAdapter(slot)
 
 
@@ -1046,7 +862,7 @@ def _complete_phone_verification_locked(
 ) -> dict:
     attempts = max(
         1,
-        max((int(phone.number_attempts or 1) for phone in phone_pool.phones if phone.provider in RENTAL_PROVIDERS), default=1),
+        max((int(phone.number_attempts or 1) for phone in phone_pool.phones if phone.provider == "smsbower"), default=1),
     )
     last_result: dict = {}
     attempt = 1
@@ -1115,7 +931,7 @@ def _phone_number_already_in_use(result: dict) -> bool:
 
 
 def _should_retry_with_new_smsbower_number(phone_pool: PhonePool, result: dict) -> bool:
-    if not any(phone.provider in RENTAL_PROVIDERS for phone in phone_pool.phones):
+    if not any(phone.provider == "smsbower" for phone in phone_pool.phones):
         return False
     error = str(result.get("error") or "").strip().lower()
     body = str(result.get("body") or "").lower()
@@ -1166,7 +982,7 @@ def _complete_phone_verification_once_locked(
         phone_slot.sms_poll_interval = sms_poll_interval
 
     selected_proxy = proxy
-    if phone_slot.provider in RENTAL_PROVIDERS:
+    if phone_slot.provider == "smsbower":
         try:
             from .phone_proxy import apply_proxy_to_session, phone_proxy_cfg, select_phone_proxy
             proxy_cfg = phone_proxy_cfg()
@@ -1198,7 +1014,7 @@ def _complete_phone_verification_once_locked(
             if selected_proxy:
                 print(f"[*] Phone proxy ready: region={proxy_result.get('region', '')} ip={proxy_result.get('ip', '')}")
 
-    if phone_slot.provider in RENTAL_PROVIDERS and not _prepare_provider_for_send(phone_slot):
+    if phone_slot.provider == "smsbower" and not _prepare_provider_for_send(phone_slot):
         return {"ok": False, "error": f"{phone_slot.provider}_prepare_failed", "phone": phone_slot.phone}
 
     phone = normalize_phone(phone_slot.phone)
@@ -1207,14 +1023,14 @@ def _complete_phone_verification_once_locked(
     send_result = _send_phone_otp_with_retries(session, did, current_url, phone_slot, phone, sentinel=sentinel, proxy=selected_proxy)
     phone_pool.save_state()
     if not send_result.get("ok"):
-        if phone_slot.provider in RENTAL_PROVIDERS and _phone_number_already_in_use(send_result):
+        if phone_slot.provider == "smsbower" and _phone_number_already_in_use(send_result):
             print(f"  [{phone_slot.provider}] phone already in use; cancelling activation {phone_slot.activation_id} before retry")
             _cancel_provider_activation(phone_slot)
             phone_pool.save_state()
         elif _is_terminal_send_rejection(send_result):
             detail = send_result.get("error_code") or send_result.get("status_code", 0)
             _retire_phone_slot_for_batch(phone_pool, phone_slot, f"phone_send_failed:{detail}")
-        elif phone_slot.provider in RENTAL_PROVIDERS and not _should_keep_activation_after_send_failure(send_result):
+        elif phone_slot.provider == "smsbower" and not _should_keep_activation_after_send_failure(send_result):
             _cancel_provider_activation(phone_slot)
             phone_pool.save_state()
         detail = send_result.get("error_code") or send_result.get("status_code", 0)
@@ -1230,7 +1046,7 @@ def _complete_phone_verification_once_locked(
     code = _sms_provider_adapter(phone_slot).wait_code()
 
     if not code:
-        if phone_slot.provider in RENTAL_PROVIDERS:
+        if phone_slot.provider == "smsbower":
             print(f"  [{phone_slot.provider}] SMS timeout; cancelling activation {phone_slot.activation_id} so this run can buy a new number")
             _cancel_provider_activation(phone_slot)
             phone_pool.save_state()
@@ -1244,7 +1060,7 @@ def _complete_phone_verification_once_locked(
     print(f"[*] SMS code received: {code}")
     validate_result = validate_phone_otp(session, did, code, sentinel=sentinel, proxy=selected_proxy)
     if not validate_result.get("ok"):
-        if phone_slot.provider in RENTAL_PROVIDERS:
+        if phone_slot.provider == "smsbower":
             if _is_terminal_validate_rejection(validate_result):
                 print(f"  [{phone_slot.provider}] phone rejected by OpenAI; cancelling activation {phone_slot.activation_id} so next round buys a new number")
             _cancel_provider_activation(phone_slot)
@@ -1263,7 +1079,7 @@ def _complete_phone_verification_once_locked(
     reuse_count = phone_slot.reuse_count
     max_reuse_count = phone_slot.max_reuse_count
     remaining = phone_slot.remaining
-    if phone_slot.provider in RENTAL_PROVIDERS and phone_slot.is_exhausted:
+    if phone_slot.provider == "smsbower" and phone_slot.is_exhausted:
         print(f"  [{phone_slot.provider}] activation {phone_slot.activation_id} reached reuse limit; completing now")
         _complete_provider_activation(phone_slot)
         phone_pool.save_state()
@@ -1294,11 +1110,9 @@ def print_phone_pool_status(pool: PhonePool):
         provider = f" [{phone.provider}]" if phone.provider != "legacy" else ""
         display = phone.phone or "(pending acquire)"
         service = f" service={phone.service}" if phone.provider == "smsbower" else ""
-        product = f" product={phone.product}" if phone.provider == "5sim" else ""
-        operator = f" operator={phone.operator}" if phone.provider == "5sim" else ""
-        country = f" country={phone.country}" if phone.provider in RENTAL_PROVIDERS else ""
+        country = f" country={phone.country}" if phone.provider == "smsbower" else ""
         print(
-            f"  [{index}] {display}{provider}{service}{product}{operator}{country} | "
+            f"  [{index}] {display}{provider}{service}{country} | "
             f"reuse: {phone.reuse_count}/{phone.max_reuse_count} | {status}{current}"
         )
     print(f"{'=' * 50}\n")

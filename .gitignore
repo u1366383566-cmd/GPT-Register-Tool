@@ -1,4 +1,10 @@
 config.json
+proxy.json
+runtime.json
+payment.json
+.env
+.env.*
+!.env.example
 .agents/skills/
 .claude/
 .codex/
@@ -7,7 +13,7 @@ services/mail-otp-web/config.json
 outlook_results/
 dist/
 sessions/
-runtime/
+/runtime/
 browser_extensions/
 .dotnet/
 sms_tool/sentinel_cache.json
@@ -20,6 +26,15 @@ skills-lock.json
 __pycache__/
 *.py[cod]
 .pytest_cache/
+
+# === 一次性诊断/探测脚本（常内联明文凭据，禁止入库）===
+# 忽略仓库根目录与 scripts/ 下的 _*.py。切勿写成裸 "_*.py"：那会连带忽略所有
+# __init__.py（同样以 _ 开头），导致新建的包无法入库、无法导入。
+# scripts/ 这条是 2026-08-31 补的：此前只挡根目录，scripts/_diag_*.py 无人拦，
+# 结果 scripts/pick_final_replacements.py 带着 3 个真实凭据前缀进了公开仓库。
+/_*.py
+scripts/_*.py
+build_log.txt
 *~
 *.bak
 *.bak_before_*
@@ -29,8 +44,11 @@ runtime/**/*.log
 
 SmsWorkbench/bin/
 SmsWorkbench/obj/
+SmsWorkbench/*_wpftmp.csproj
 tests/**/bin/
 tests/**/obj/
+SmsWorkbench.Contracts/bin/
+SmsWorkbench.Contracts/obj/
 
 .vs/
 .idea/
@@ -49,3 +67,9 @@ scripts/installer/payload.zip
 
 /.retention.*.log
 /nul
+
+# === 本地虚拟环境（359M，禁止入库）===
+.venv/
+
+# === 本地日志（不入库）===
+logs/

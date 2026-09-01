@@ -7,6 +7,13 @@
   "mailbox_proxy": "http://127.0.0.1:7897",
   "proxy": {
     "registration": "http://127.0.0.1:7897",
+    "browser_registration_pool": [
+      "http://127.0.0.1:7897"
+    ],
+    "protocol_registration_pool": [
+      "http://127.0.0.1:7897"
+    ],
+    "health": "http://127.0.0.1:7897",
     "default": "http://127.0.0.1:7897",
     "pool": [
       "us.ipwo.net:7878:YOUR_USER_custom_zone_US:YOUR_PASSWORD",
@@ -15,6 +22,76 @@
     ]
   },
   "registration": {
+    "driver": "protocol",
+    "browser_headless": true,
+    "browser_timeout_seconds": 90,
+    "browser_locale": "en-US",
+    "browser_timezone": "America/New_York",
+    "post_registration_dwell_seconds_range": "18,45",
+    "chatgpt_bootstrap": {
+      "enabled": false,
+      "anonymous": true,
+      "authenticated": true
+    },
+    "humanize": {
+      "enabled": false,
+      "factor": 1.0
+    },
+    "reject_cloud_proxy": false,
+    "drivers": {
+      "playwright": {
+        "start_url": "https://chatgpt.com/auth/login"
+      },
+      "roxy": {
+        "api_base": "http://127.0.0.1:50000",
+        "backend": "playwright",
+        "api_token": "",
+        "workspace_id": "",
+          "project_id": "",
+          "profile_id": "",
+          "create_path": "/browser/create",
+          "create_method": "POST",
+          "open_path": "/browser/open",
+          "open_method": "POST",
+          "close_path": "/browser/close",
+          "close_method": "POST",
+          "delete_path": "/browser/delete",
+          "delete_method": "POST",
+        "delete_profile_after_run": true,
+        "keep_browser_open": false,
+        "start_url": "https://chatgpt.com/auth/login"
+      },
+      "cloak": {
+        "humanize": true,
+        "geoip": true,
+        "use_proxy": true,
+        "license_key": "",
+        "fingerprint_seed": "",
+        "user_data_dir": "",
+        "keep_browser_open": false,
+        "start_url": "https://chatgpt.com/auth/login"
+      },
+      "camoufox": {
+        "humanize": true,
+        "geoip": true,
+        "use_proxy": true,
+        "max_width": 1280,
+        "max_height": 900,
+        "locale": "",
+        "timezone": "",
+        "user_data_dir": "",
+        "disable_content_sandbox": true,
+        "keep_browser_open": false,
+        "start_url": "https://chatgpt.com/auth/login"
+      },
+      "adspower": {
+        "api_base": "http://127.0.0.1:50325",
+        "user_id": "",
+        "headless": false,
+        "keep_browser_open": false,
+        "start_url": "https://chatgpt.com/auth/login"
+      }
+    },
     "password_random_length": 12,
     "password_suffix": "!A1",
     "password_charset": "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789",
@@ -23,7 +100,21 @@
     "at_stability_probe_count": 2,
     "at_stability_probe_delay_seconds": 10,
     "at_probe_timeout_seconds": 30,
-    "stage_concurrency": { "auth": 1, "network": 4, "at_probe": 4 }
+    "stage_concurrency": { "auth": 1, "network": 4, "at_probe": 4 },
+    "pulse": {
+      "enabled": true,
+      "wave_size": 4,
+      "wave_delay_seconds": 5,
+      "ban_threshold": 2,
+      "ban_pause_seconds": 60,
+      "max_waves": 0
+    },
+    "browser_process_pool": {
+      "enabled": true,
+      "max_concurrent": 4,
+      "max_uses_per_process": 10,
+      "recycle_on_error": true
+    }
   },
   "email_registration": {
     "registration_mode": "passwordless",
@@ -60,8 +151,10 @@
     },
     "otp_poll_interval": 2,
     "sentinel_version": "20260219f9f6",
+    "sentinel_backend": "node_runner",
+    "sentinel_legacy_fallback": true,
     "sentinel_max_concurrency": 2,
-    "sentinel_prewarm_window": 4,
+    "sentinel_prewarm_window": 0,
     "sentinel_circuit_failures": 3,
     "sentinel_circuit_cooldown_seconds": 60,
     "remail_otp_issued_after_grace_seconds": 90,
@@ -300,7 +393,7 @@
     "registration_timeout": 180
   },
   "phone_reuse": {
-    "source": "5sim",
+    "source": "smsbower",
     "max_reuse_count": 1,
     "send_cooldown_seconds": 45,
     "send_retry_attempts": 3,
@@ -309,19 +402,6 @@
     "proxy": "http://127.0.0.1:7897",
     "proxy_match_phone_country": false,
     "proxy_random_sid": false,
-    "5sim": {
-      "api_key": "$5SIM_API_KEY",
-      "product": "openai",
-      "country": "ghana",
-      "operator": "any",
-      "max_price": "",
-      "sms_timeout": 120,
-      "sms_poll_interval": 5,
-      "number_attempts": 3,
-      "send_cooldown_seconds": 45,
-      "send_retry_attempts": 3,
-      "send_retry_delay_seconds": 45
-    },
     "smsbower": {
       "api_key": "$SMSBOWER_API_KEY",
       "service": "dr",
@@ -343,6 +423,26 @@
   "output": {
     "directory": "sessions",
     "filename_pattern": "session_{email}_{timestamp}.json"
+  },
+  "account_health": {
+    "post_registration_enabled": true,
+    "post_registration_deep_liveness": true,
+    "proxy_pool": [
+      "http://127.0.0.1:7897"
+    ],
+    "proxies": {
+      "liveness": [
+        "http://127.0.0.1:7897"
+      ],
+      "promotion": [
+        "http://127.0.0.1:7897"
+      ],
+      "browser": [
+        "http://127.0.0.1:7897"
+      ]
+    },
+    "workers": 2,
+    "max_pending": 1000
   },
   "paypal_browser": {
     "enabled": true,

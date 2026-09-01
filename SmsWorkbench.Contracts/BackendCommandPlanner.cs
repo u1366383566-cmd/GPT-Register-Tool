@@ -23,8 +23,8 @@ namespace SmsWorkbench
     /// (registration, SMS, liveness, deletion, import, export, refresh,
     /// protocol payment, inbox). It generalizes the
     /// <see cref="ProtocolPaymentExecutionPlanner"/> pattern so the CLI
-    /// contract lives in exactly one module that can be unit tested without
-    /// WPF. Settings resolution stays with the caller; this class only shapes
+    /// contract lives in exactly one module that can be unit tested by every
+    /// client adapter. Settings resolution stays with the caller; this class only shapes
     /// already-resolved values into command-line arguments.
     /// </summary>
     public static class BackendCommandPlanner
@@ -181,17 +181,15 @@ namespace SmsWorkbench
             IReadOnlyList<string> emails,
             string sessionFile,
             IReadOnlyList<string> proxyPool,
-            string tempDirectory = null,
-            string phoneSource = "5sim")
+            string tempDirectory = null)
         {
             RequireArgument(mailboxArgument, nameof(mailboxArgument));
             RequireArgument(mailboxFile, nameof(mailboxFile));
             List<string> targets = RequireEmails(emails);
-            string normalized = NormalizePhoneSource(phoneSource);
             var args = new List<string>
             {
                 "--one-click-sms",
-                "--phone-source", normalized,
+                "--phone-source", "smsbower",
                 "--workers", "1",
                 "--refresh-timeout", "60",
                 mailboxArgument, mailboxFile,
@@ -255,6 +253,38 @@ namespace SmsWorkbench
                 "账号测活(" + Count(targets.Count) + ")",
                 args,
                 TemporaryFiles: tempFiles);
+        }
+
+        public static BackendCommandPlan CreateChangeEmail(
+            IReadOnlyList<string> emails,
+            string provider,
+            string mailboxFile,
+            int workers,
+            string smailrDomain,
+            string cfworkerDomain,
+            IReadOnlyList<string> proxyPool,
+            string tempDirectory = null)
+        {
+            List<string> targets = RequireEmails(emails);
+            RequireArgument(provider, nameof(provider));
+            var args = new List<string>
+            {
+                "--change-email",
+                "--change-email-provider", provider.Trim().ToLowerInvariant(),
+                "--change-email-workers", Count(workers),
+            };
+            var tempFiles = new List<string>();
+            string emailFile = WriteEmailFile(tempDirectory, "change_email_accounts_", targets);
+            tempFiles.Add(emailFile);
+            args.AddRange(new[] { "--email-file", emailFile });
+            if (!string.IsNullOrWhiteSpace(mailboxFile))
+                args.AddRange(new[] { "--change-email-mailbox-file", mailboxFile.Trim() });
+            if (!string.IsNullOrWhiteSpace(smailrDomain))
+                args.AddRange(new[] { "--change-email-smailr-domain", smailrDomain.Trim() });
+            if (!string.IsNullOrWhiteSpace(cfworkerDomain))
+                args.AddRange(new[] { "--cfworker-domain", cfworkerDomain.Trim() });
+            AppendProxyPool(args, proxyPool);
+            return new BackendCommandPlan("批量邮箱换绑(" + Count(targets.Count) + ")", args, TemporaryFiles: tempFiles, TimeoutMilliseconds: 900000);
         }
 
         public static BackendCommandPlan CreatePromotionCheck(
@@ -375,12 +405,6 @@ namespace SmsWorkbench
             return value is "sub2api" or "cliproxyapi" ? value : "cpa";
         }
 
-        public static string NormalizePhoneSource(string phoneSource)
-        {
-            string value = (phoneSource ?? "").Trim().ToLowerInvariant();
-            return value is "5sim" or "smsbower" ? value : "5sim";
-        }
-
         public static string ImportTargetLabel(string target)
         {
             string value = (target ?? "").Trim().ToLowerInvariant();
@@ -446,36 +470,6 @@ namespace SmsWorkbench
         public static BackendCommandPlan CreateRebuildSqlite()
         {
             return new BackendCommandPlan("重建SQLite索引", new List<string> { "--rebuild-sqlite" });
-        }
-
-        public static BackendCommandPlan CreateMarkPaymentComplete(string email, string sessionFile)
-        {
-            var args = new List<string>
-            {
-                "--email", RequireEmail(email),
-                "--mark-paypal-status", "completed",
-                "--workers", "4",
-            };
-            AppendSessionFile(args, sessionFile);
-            return new BackendCommandPlan("标记支付完成", args);
-        }
-
-        public static BackendCommandPlan CreateMarkPaymentCompleteBatch(
-            IReadOnlyList<string> emails,
-            string tempDirectory = null)
-        {
-            List<string> targets = RequireEmails(emails);
-            string emailFile = WriteEmailFile(tempDirectory, "paypal_completed_emails_", targets);
-            var args = new List<string>
-            {
-                "--mark-paypal-status", "completed",
-                "--email-file", emailFile,
-                "--workers", "4",
-            };
-            return new BackendCommandPlan(
-                "批量标记支付完成 (" + Count(targets.Count) + ")",
-                args,
-                TemporaryFiles: new[] { emailFile });
         }
 
         // ── Inbox ───────────────────────────────────────────────────────
@@ -545,7 +539,7 @@ namespace SmsWorkbench
             if (value.StartsWith("remail://", StringComparison.OrdinalIgnoreCase)) return "--mailbox-file";
             if (value.StartsWith("smailr://", StringComparison.OrdinalIgnoreCase)) return "--mailbox-file";
             if (value.StartsWith("gmail://", StringComparison.OrdinalIgnoreCase)) return "--mailbox-file";
-            if (MailboxPoolFileStore.TryParseICloudUrlLine(value, out _, out _)) return "--mailbox-file";
+            if (MailboxCredentialLineParser.TryParseICloudUrlLine(value, out _, out _)) return "--mailbox-file";
             if (value.Contains("----", StringComparison.Ordinal) && value.Split("----", StringSplitOptions.None).Length >= 4) return "--chatai-mailbox-file";
             if (value.Contains("---", StringComparison.Ordinal) && value.Split("---", StringSplitOptions.None).Length >= 3) return "--mailbox-file";
             return "";

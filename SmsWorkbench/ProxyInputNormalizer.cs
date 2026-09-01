@@ -9,9 +9,32 @@ namespace SmsWorkbench
         private static readonly string[] SupportedSchemes = ["http", "https", "socks5", "socks5h"];
         private static readonly string[] ListSeparators = ["\r\n", "\n", ",", ";"];
 
+        /// <summary>
+        /// Wrapping characters left behind when structured text is pasted in
+        /// (JSON arrays, CSV columns, shell snippets). Stripped from both ends
+        /// of every entry; none of them can legitimately start or end a proxy
+        /// URL, so this never eats real input.
+        /// </summary>
+        private static readonly char[] PasteNoiseChars =
+            ['[', ']', '"', '\'', ',', ';', '{', '}', '“', '”', '‘', '’'];
+
+        /// <summary>
+        /// Line separator used whenever proxy lists are serialized back to text
+        /// (config persistence and backend command-line arguments). Proxy lists
+        /// are data, not display text, so they stay platform-neutral: a config
+        /// written on Windows must be byte-identical on Linux.
+        /// <see cref="ListSeparators"/> parses either form back.
+        /// </summary>
+        public const string LineSeparator = "\n";
+
         public static string Normalize(string value, string defaultScheme = "http")
         {
             string raw = (value ?? "").Trim().Replace('：', ':');
+            // Pasting a JSON array, a CSV column or a shell snippet leaves its
+            // wrapping characters behind ("\"http://...\",", "[...]", "http://...;").
+            // Strip them from both ends first, otherwise the quote/bracket is
+            // treated as part of the scheme and rejected as an unknown protocol.
+            raw = raw.Trim(PasteNoiseChars).Trim();
             if (raw.Length == 0)
                 return "";
 
@@ -55,6 +78,10 @@ namespace SmsWorkbench
                 .Select(item => item.Trim())
                 .Where(item => item.Length > 0)
                 .Select(item => Normalize(item, defaultScheme))
+                // Entries that were nothing but paste noise ("[" / "]" lines)
+                // normalize to an empty string; drop them instead of writing
+                // blank entries into the config.
+                .Where(item => item.Length > 0)
                 .Distinct(StringComparer.OrdinalIgnoreCase)
                 .ToArray();
 
@@ -82,7 +109,7 @@ namespace SmsWorkbench
         }
 
         public static string NormalizeListText(string value, string defaultScheme = "http")
-            => string.Join(Environment.NewLine, NormalizeList(value, defaultScheme));
+            => string.Join(LineSeparator, NormalizeList(value, defaultScheme));
 
         private static string NormalizeUrlForm(string scheme, string remainder)
         {
@@ -113,9 +140,13 @@ namespace SmsWorkbench
         private static string NormalizeScheme(string scheme)
         {
             string normalized = (scheme ?? "http").Trim().ToLowerInvariant();
+            // Tolerate stray whitespace from copy-paste or IME half-state so
+            // "Socks 5h" / " socks5h " round-trip to the same canonical form.
+            normalized = Regex.Replace(normalized, @"\s+", "");
             if (normalized == "socks") normalized = "socks5";
             if (!SupportedSchemes.Contains(normalized, StringComparer.Ordinal))
-                throw new FormatException("代理协议仅支持 http、https、socks5 或 socks5h。");
+                throw new FormatException(
+                    $"代理协议「{scheme}」不支持，仅接受 http、https、socks5 或 socks5h。");
             return normalized;
         }
 
